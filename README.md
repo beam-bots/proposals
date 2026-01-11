@@ -4,9 +4,14 @@ SPDX-FileCopyrightText: 2026 James Harton
 SPDX-License-Identifier: Apache-2.0
 -->
 
+<img src="https://github.com/beam-bots/bb/blob/main/logos/beam_bots_logo.png?raw=true" alt="Beam Bots Logo" width="250" />
+
 # Beam Bots Proposals
 
-Feature proposals for the Beam Bots robotics framework.
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache--2.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
+[![REUSE status](https://api.reuse.software/badge/github.com/beam-bots/proposals)](https://api.reuse.software/info/github.com/beam-bots/proposals)
+
+Feature proposals for the [Beam Bots](https://github.com/beam-bots/bb) robotics framework.
 
 ## Process
 
@@ -46,4 +51,6 @@ See [template.md](template.md) for the proposal format.
 
 | # | Name | Status | Package |
 |---|------|--------|---------|
-| — | — | — | — |
+| [0001](https://github.com/beam-bots/proposals/pull/1) | bb_teleop | Proposed | `bb_teleop` |
+| [0002](https://github.com/beam-bots/proposals/pull/2) | bb_policy | Proposed | `bb_policy` |
+| [0003](https://github.com/beam-bots/proposals/pull/3) | bb_dataset | Proposed | `bb_dataset` |
