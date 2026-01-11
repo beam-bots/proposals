@@ -54,3 +54,5 @@ See [template.md](template.md) for the proposal format.
 | [0001](https://github.com/beam-bots/proposals/pull/1) | bb_teleop | Proposed | `bb_teleop` |
 | [0002](https://github.com/beam-bots/proposals/pull/2) | bb_policy | Proposed | `bb_policy` |
 | [0003](https://github.com/beam-bots/proposals/pull/3) | bb_dataset | Proposed | `bb_dataset` |
+| [0004](https://github.com/beam-bots/proposals/pull/4) | bb_mcp | Proposed | `bb_mcp` |
+| [0005](https://github.com/beam-bots/proposals/pull/5) | bb_tui | Proposed | `bb_tui` |
