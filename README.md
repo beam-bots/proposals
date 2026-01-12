@@ -57,7 +57,7 @@ See [template.md](template.md) for the proposal format.
 | [0004](https://github.com/beam-bots/proposals/pull/4) | bb_mcp | Implemented | `bb_mcp` |
 | [0005](https://github.com/beam-bots/proposals/pull/5) | bb_tui | Accepted | `bb_tui` |
 | [0006](https://github.com/beam-bots/proposals/pull/6) | bb_motion_planning | Accepted | `bb_motion_planning` |
-| [0007](https://github.com/beam-bots/proposals/pull/7) | Usage Rules for Beam Bots Packages | Proposed | — |
+| [0007](https://github.com/beam-bots/proposals/pull/7) | Usage Rules for Beam Bots Packages | Accepted | — |
 | [0008](https://github.com/beam-bots/proposals/pull/9) | bb_mavlink | Proposed | `bb_mavlink` |
 | [0009](https://github.com/beam-bots/proposals/pull/11) | bb_jido | Implemented | `bb_jido` |
 | [0014](https://github.com/beam-bots/proposals/pull/14) | handler-level introspection | Proposal | `bb` |
