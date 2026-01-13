@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 James Harton
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  CI:
+    uses: beam-bots/.github/.github/workflows/docs-ci.yml@ea14ecfba98c3efb2f8a85d75fabc4c9d7d38c1a # main
