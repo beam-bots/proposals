@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal: bb_jido
 
-**Status:** Draft
+**Status:** Accepted
 **Author:** James Harton
 **Created:** 2026-01-20
 **Updated:** 2026-03-29 — incorporated implementation analysis from @houllette
