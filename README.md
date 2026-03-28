@@ -51,12 +51,12 @@ See [template.md](template.md) for the proposal format.
 
 | # | Name | Status | Package |
 |---|------|--------|---------|
-| [0001](https://github.com/beam-bots/proposals/pull/1) | bb_teleop | Proposed | `bb_teleop` |
-| [0002](https://github.com/beam-bots/proposals/pull/2) | bb_policy | Proposed | `bb_policy` |
-| [0003](https://github.com/beam-bots/proposals/pull/3) | bb_dataset | Proposed | `bb_dataset` |
-| [0004](https://github.com/beam-bots/proposals/pull/4) | bb_mcp | Proposed | `bb_mcp` |
-| [0005](https://github.com/beam-bots/proposals/pull/5) | bb_tui | Proposed | `bb_tui` |
-| [0006](https://github.com/beam-bots/proposals/pull/6) | bb_motion_planning | Proposed | `bb_motion_planning` |
+| [0001](https://github.com/beam-bots/proposals/pull/1) | bb_teleop | Accepted | `bb_teleop` |
+| [0002](https://github.com/beam-bots/proposals/pull/2) | bb_policy | Accepted | `bb_policy` |
+| [0003](https://github.com/beam-bots/proposals/pull/3) | bb_dataset | Accepted | `bb_dataset` |
+| [0004](https://github.com/beam-bots/proposals/pull/4) | bb_mcp | Accepted | `bb_mcp` |
+| [0005](https://github.com/beam-bots/proposals/pull/5) | bb_tui | Accepted | `bb_tui` |
+| [0006](https://github.com/beam-bots/proposals/pull/6) | bb_motion_planning | Accepted | `bb_motion_planning` |
 | [0007](https://github.com/beam-bots/proposals/pull/7) | Usage Rules for Beam Bots Packages | Proposed | — |
 | [0008](https://github.com/beam-bots/proposals/pull/9) | bb_mavlink | Proposed | `bb_mavlink` |
-| [0009](https://github.com/beam-bots/proposals/pull/11) | bb_jido | Proposed | `bb_jido` |
+| [0009](https://github.com/beam-bots/proposals/pull/11) | bb_jido | Accepted | `bb_jido` |
