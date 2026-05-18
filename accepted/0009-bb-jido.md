@@ -10,6 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 **Author:** James Harton
 **Created:** 2026-01-20
 **Updated:** 2026-03-29 — incorporated implementation analysis from @houllette
+**Updated:** 2026-05-18 — aligned with Jido v2.2 (instance-scoped supervision, Skill→Plugin rename, removal of `actions:` on `use Jido.Agent`, removal of `handle_instruction`/`handle_signal` agent callbacks)
 **Dependencies:** `bb_reactor` (optional, for workflow integration)
 
 ---
@@ -239,162 +240,203 @@ defmodule BB.Jido.Signal do
 end
 ```
 
-### Robot Agent Definition
+### Robot Plugin
 
-Define agents that control robots:
+Jido v2.0 removed the `actions:` option from `use Jido.Agent`. Agent capabilities are now declared inside **Plugins** (the v2 rename of "Skills") that are attached via `plugins:`. We therefore expose robot integration as a plugin rather than an agent macro:
 
 ```elixir
-defmodule BB.Jido.Agent do
+defmodule BB.Jido.Plugin.Robot do
   @moduledoc """
-  Behaviour for Jido agents that control Beam Bots robots.
+  Jido Plugin that gives an agent the ability to control a Beam Bots robot.
 
-  Extends Jido.Agent with robotics-specific conveniences:
-  - Automatic BB sensor registration
-  - Safety state awareness
-  - Standard robot actions pre-registered
+  Provides:
+  - Standard robot actions (Command, Reactor, WaitForState, GetJointState)
+  - Robot-related state (safety_state, last_joint_state)
+  - Default signal routes for `bb.*` signal types
+  - Automatic PubSubBridge startup (mounted under the agent's pid)
   """
 
-  defmacro __using__(opts) do
-    robot = Keyword.fetch!(opts, :robot)
+  use Jido.Plugin,
+    name: "bb_robot",
+    state_key: :robot,
+    actions: [
+      BB.Jido.Action.Command,
+      BB.Jido.Action.Reactor,
+      BB.Jido.Action.WaitForState,
+      BB.Jido.Action.GetJointState
+    ],
+    schema: [
+      robot: [type: :atom, required: true],
+      safety_state: [type: :atom, default: :unknown],
+      last_joint_state: [type: :map, default: %{}]
+    ],
+    signal_routes: [
+      {"bb.command.execute", BB.Jido.Action.Command},
+      {"bb.reactor.run", BB.Jido.Action.Reactor},
+      {"bb.state.wait", BB.Jido.Action.WaitForState}
+    ]
 
-    quote do
-      use Jido.Agent,
-        name: unquote(opts[:name] || "bb_agent"),
-        description: unquote(opts[:description] || "Beam Bots robot agent"),
-        actions: [
-          BB.Jido.Action.Command,
-          BB.Jido.Action.Reactor,
-          BB.Jido.Action.WaitForState,
-          BB.Jido.Action.GetJointState
-          | unquote(opts[:actions] || [])
-        ],
-        schema: [
-          robot: [type: :atom, default: unquote(robot)],
-          safety_state: [type: :atom, default: :unknown]
-          | unquote(opts[:schema] || [])
-        ]
+  @impl Jido.Plugin
+  def mount(agent, %{robot: robot} = config) do
+    {:ok, bridge} =
+      BB.Jido.PubSubBridge.start_link(
+        robot: robot,
+        agent_pid: self(),
+        topics: Map.get(config, :topics, default_topics())
+      )
 
-      @robot unquote(robot)
-
-      def robot, do: @robot
-    end
+    {:ok, %{robot: robot, bridge: bridge, safety_state: :unknown}}
   end
+
+  @impl Jido.Plugin
+  def handle_signal(%Jido.Signal{type: "bb.state.transition"} = sig, agent) do
+    # Pre-routing hook: cache safety state so blocking waits become rare.
+    {:ok, put_in(agent.state.robot.safety_state, sig.data.message.payload.to)}
+  end
+
+  def handle_signal(_signal, agent), do: {:ok, agent}
+
+  defp default_topics, do: [[:state_machine], [:safety]]
+end
+```
+
+Users attach the plugin to a vanilla `Jido.Agent`:
+
+```elixir
+defmodule MyRobot.Agent do
+  use Jido.Agent,
+    name: "my_robot",
+    plugins: [{BB.Jido.Plugin.Robot, %{robot: MyRobot}}]
 end
 ```
 
 ### Example: Pick and Place Agent
 
-```elixir
-defmodule MyRobot.Agents.Manipulator do
-  @moduledoc """
-  Agent that performs manipulation tasks.
+In v2.2, the agent itself stays declarative — orchestration logic lives in an action that emits directives chaining to the next step:
 
-  Given a goal like "pick up the red block", the agent:
-  1. Queries perception for object location
-  2. Selects appropriate grasp strategy
-  3. Executes pick-and-place workflow
-  4. Verifies success or retries with different approach
+```elixir
+defmodule MyRobot.Plugin.Manipulator do
+  @moduledoc """
+  Plugin that performs manipulation tasks.
+
+  Given a goal like "pick up the red block":
+  1. Locate the object via perception
+  2. Select a grasp strategy
+  3. Run the PickAndPlace reactor
+  4. Verify success or emit a recovery signal
   """
 
-  use BB.Jido.Agent,
-    robot: MyRobot,
+  use Jido.Plugin,
     name: "manipulator",
+    state_key: :manipulator,
     actions: [
       MyRobot.Actions.LocateObject,
       MyRobot.Actions.SelectGrasp,
-      MyRobot.Actions.VerifyGrip
+      MyRobot.Actions.VerifyGrip,
+      MyRobot.Actions.PickObject
+    ],
+    signal_routes: [
+      {"manipulator.pick", MyRobot.Actions.PickObject}
     ]
+end
 
-  def handle_instruction(%{action: :pick_object, target: target}, agent) do
-    with {:ok, location} <- locate(agent, target),
-         {:ok, grasp} <- select_grasp(agent, target, location),
-         {:ok, _} <- execute_pick(agent, location, grasp),
-         {:ok, _} <- verify_grip(agent) do
-      {:ok, agent, [Jido.Directive.emit("object.picked", %{target: target})]}
+defmodule MyRobot.Actions.PickObject do
+  use Jido.Action,
+    name: "pick_object",
+    schema: [target: [type: :atom, required: true]]
+
+  alias Jido.Directive.Emit
+
+  def run(%{target: target}, %{agent: agent}) do
+    robot = agent.state.robot.robot
+
+    with {:ok, %{location: location}} <-
+           MyRobot.Actions.LocateObject.run(%{target: target}, %{}),
+         {:ok, %{grasp: grasp}} <-
+           MyRobot.Actions.SelectGrasp.run(
+             %{target: target, location: location},
+             %{}
+           ),
+         {:ok, _} <-
+           BB.Jido.Action.Reactor.run(
+             %{
+               robot: robot,
+               reactor: MyRobot.Reactor.PickAndPlace,
+               inputs: %{pick_pose: location, grasp_strategy: grasp}
+             },
+             %{}
+           ),
+         {:ok, _} <- MyRobot.Actions.VerifyGrip.run(%{}, %{}) do
+      {:ok, %{target: target},
+       [%Emit{signal: Jido.Signal.new!("object.picked", %{target: target})}]}
     else
       {:error, :object_not_found} ->
-        {:ok, agent, [Jido.Directive.emit("object.not_found", %{target: target})]}
-
-      {:error, :grasp_failed} ->
-        {:retry, agent, %{strategy: :alternative}}
+        {:ok, %{target: target, recovered: false},
+         [%Emit{signal: Jido.Signal.new!("object.not_found", %{target: target})}]}
 
       {:error, reason} ->
         {:error, reason}
     end
   end
-
-  defp locate(agent, target) do
-    Jido.Agent.run_action(agent, MyRobot.Actions.LocateObject, %{target: target})
-  end
-
-  defp select_grasp(agent, target, location) do
-    Jido.Agent.run_action(agent, MyRobot.Actions.SelectGrasp, %{
-      target: target,
-      location: location
-    })
-  end
-
-  defp execute_pick(agent, location, grasp) do
-    Jido.Agent.run_action(agent, BB.Jido.Action.Reactor, %{
-      robot: agent.state.robot,
-      reactor: MyRobot.Reactor.PickAndPlace,
-      inputs: %{pick_pose: location, grasp_strategy: grasp}
-    })
-  end
-
-  defp verify_grip(agent) do
-    Jido.Agent.run_action(agent, MyRobot.Actions.VerifyGrip, %{})
-  end
 end
+```
+
+The agent dispatches the work by emitting a signal:
+
+```elixir
+:ok =
+  Jido.AgentServer.cast(
+    pid,
+    Jido.Signal.new!("manipulator.pick", %{target: :red_block})
+  )
 ```
 
 ### Multi-Robot Coordination
 
-Jido signals enable robot-to-robot coordination:
+Jido signals enable robot-to-robot coordination. In v2.2 the agent stays empty and the routing/handling lives in a plugin:
 
 ```elixir
-defmodule MyFleet.Agents.Coordinator do
+defmodule MyFleet.Plugin.Coordinator do
   @moduledoc """
-  Agent that coordinates multiple robots.
+  Plugin that coordinates multiple robots.
 
-  Receives tasks, allocates to available robots, monitors progress.
+  Receives task-completion signals, allocates next tasks, surfaces errors.
   """
 
-  use Jido.Agent,
+  use Jido.Plugin,
     name: "fleet_coordinator",
+    state_key: :fleet,
     actions: [
       MyFleet.Actions.AllocateTask,
-      MyFleet.Actions.CheckRobotStatus
+      MyFleet.Actions.HandleRobotError
+    ],
+    schema: [
+      pending: [type: {:map, :atom, :map}, default: %{}],
+      assignments: [type: {:map, :atom, :atom}, default: %{}]
+    ],
+    signal_routes: [
+      {"robot.task.completed", MyFleet.Actions.AllocateTask},
+      {"robot.error", MyFleet.Actions.HandleRobotError}
     ]
 
-  def handle_signal(%Jido.Signal{type: "robot.task.completed"} = signal, agent) do
-    robot_id = signal.data.robot_id
-    task_id = signal.data.task_id
-
-    agent = update_task_status(agent, task_id, :completed)
-
-    case get_next_task(agent, robot_id) do
-      {:ok, next_task} ->
-        {:ok, agent, [
-          Jido.Directive.emit("robot.task.assigned", %{
-            robot_id: robot_id,
-            task: next_task
-          })
-        ]}
-
-      :no_tasks ->
-        {:ok, agent, []}
-    end
+  # Pre-routing hook: maintain bookkeeping before the routed action runs.
+  @impl Jido.Plugin
+  def handle_signal(%Jido.Signal{type: "robot.task.completed"} = sig, agent) do
+    %{robot_id: robot_id, task_id: task_id} = sig.data
+    {:ok, mark_completed(agent, robot_id, task_id)}
   end
 
-  def handle_signal(%Jido.Signal{type: "robot.error"} = signal, agent) do
-    robot_id = signal.data.robot_id
-    error = signal.data.error
+  def handle_signal(_signal, agent), do: {:ok, agent}
+end
 
-    handle_robot_error(agent, robot_id, error)
-  end
+defmodule MyFleet.Agent do
+  use Jido.Agent,
+    name: "fleet_coordinator",
+    plugins: [MyFleet.Plugin.Coordinator]
 end
 ```
+
+`MyFleet.Actions.AllocateTask` is a regular `Jido.Action` that returns `{:ok, result, [%Jido.Directive.Emit{…}]}` to emit `robot.task.assigned` for the chosen robot.
 
 ### Safety Integration
 
@@ -447,9 +489,10 @@ bb_jido/
 │           │   ├── wait_for_state.ex  # Wait for robot state
 │           │   ├── get_joint_state.ex # Read joint positions
 │           │   └── safety_aware.ex    # Safety checking mixin
+│           ├── plugin/
+│           │   └── robot.ex           # BB.Jido.Plugin.Robot
 │           ├── pubsub_bridge.ex       # BB.PubSub → Jido signal bridge (GenServer)
 │           ├── signal.ex              # Canonical signal mapping
-│           ├── agent.ex               # BB.Jido.Agent macro
 │           └── telemetry.ex           # Telemetry events
 ├── test/
 ├── mix.exs
@@ -464,12 +507,14 @@ bb_jido/
 defp deps do
   [
     {:bb, "~> 0.13"},
-    {:jido, "~> 2.1"},
+    {:jido, "~> 2.2"},
     # Optional: for AI-driven planning
-    {:jido_ai, "~> 1.0", optional: true}
+    {:jido_ai, "~> 2.1", optional: true}
   ]
 end
 ```
+
+Jido v2.0 requires Elixir `~> 1.18`. `jido_action` and `jido_signal` are pulled in transitively by `jido`; pin them directly only if `bb_jido` needs a newer point release than `jido`'s current range allows.
 
 ---
 
@@ -478,75 +523,84 @@ end
 ### Simple Agent
 
 ```elixir
-# Define an agent for your robot
 defmodule MyRobot.Agent do
-  use BB.Jido.Agent, robot: MyRobot
-
-  def handle_instruction(%{action: :home}, agent) do
-    result = Jido.Agent.run_action(agent, BB.Jido.Action.Command, %{
-      robot: MyRobot,
-      command: :home,
-      goal: %{}
-    })
-
-    case result do
-      {:ok, _} -> {:ok, agent, []}
-      {:error, reason} -> {:error, reason}
-    end
-  end
+  use Jido.Agent,
+    name: "my_robot",
+    plugins: [{BB.Jido.Plugin.Robot, %{robot: MyRobot}}]
 end
 
-# Start and instruct
-{:ok, agent} = MyRobot.Agent.start_link()
-:ok = Jido.Agent.instruct(agent, %{action: :home})
+# Start under your Jido instance and send it a signal:
+{:ok, pid} = Jido.start_agent(MyApp.Jido, MyRobot.Agent)
+
+:ok =
+  Jido.AgentServer.cast(
+    pid,
+    Jido.Signal.new!(
+      "bb.command.execute",
+      %{robot: MyRobot, command: :home, goal: %{}}
+    )
+  )
 ```
 
 ### With AI Planning (jido_ai)
 
+`jido_ai` v2 exposes planning as plain Jido Actions (`Jido.AI.Actions.Planning.Plan`, `.Decompose`, `.Prioritize`) rather than a top-level `Jido.AI.plan/2` function. You attach them like any other action:
+
 ```elixir
-# Agent that uses LLM for task decomposition
-defmodule MyRobot.SmartAgent do
-  use BB.Jido.Agent,
-    robot: MyRobot,
-    actions: [
-      BB.Jido.Action.Command,
-      BB.Jido.Action.Reactor,
-      MyRobot.Actions.LocateObject,
-      MyRobot.Actions.InspectObject
+defmodule MyRobot.PlannerPlugin do
+  use Jido.Plugin,
+    name: "planner",
+    state_key: :planner,
+    actions: [Jido.AI.Actions.Planning.Plan],
+    signal_routes: [
+      {"robot.goal.natural_language", Jido.AI.Actions.Planning.Plan}
     ]
-
-  def handle_instruction(%{natural_language: text}, agent) do
-    case Jido.AI.plan(agent, text) do
-      {:ok, plan} ->
-        execute_plan(agent, plan)
-
-      {:error, reason} ->
-        {:error, {:planning_failed, reason}}
-    end
-  end
 end
 
-# Usage
-Jido.Agent.instruct(agent, %{
-  natural_language: "Pick up the red block and place it in the bin"
-})
+defmodule MyRobot.SmartAgent do
+  use Jido.Agent,
+    name: "smart_robot",
+    plugins: [
+      {BB.Jido.Plugin.Robot, %{robot: MyRobot}},
+      MyRobot.PlannerPlugin
+    ]
+end
+
+:ok =
+  Jido.AgentServer.cast(
+    pid,
+    Jido.Signal.new!("robot.goal.natural_language", %{
+      goal: "Pick up the red block and place it in the bin"
+    })
+  )
 ```
+
+The planner action's directives chain into `bb.reactor.run` / `bb.command.execute` signals handled by `BB.Jido.Plugin.Robot`.
 
 ### Supervised in Application
 
+Jido v2 requires an instance-scoped supervisor. Each app declares its own:
+
 ```elixir
+defmodule MyApp.Jido do
+  use Jido, otp_app: :my_app
+end
+
 defmodule MyApp.Application do
   use Application
 
   def start(_type, _args) do
     children = [
       MyRobot,
-      {MyRobot.Agent, robot: MyRobot}
+      {Jido, name: MyApp.Jido}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one)
   end
 end
+
+# Then, after boot:
+{:ok, _pid} = Jido.start_agent(MyApp.Jido, MyRobot.Agent, id: "main")
 ```
 
 ---
@@ -558,7 +612,7 @@ end
 - [ ] `BB.Jido.Action.Command` - Execute BB commands as Jido actions
 - [ ] `BB.Jido.Action.Reactor` - Run BB.Reactor workflows as Jido actions
 - [ ] `BB.Jido.PubSubBridge` + `BB.Jido.Signal` - Bridge BB.PubSub events to Jido signals
-- [ ] `BB.Jido.Agent` - Macro for defining robot-controlling agents
+- [ ] `BB.Jido.Plugin.Robot` - Jido v2 plugin that owns robot state, default actions, and default signal routes; mounts the PubSubBridge
 - [ ] Safety integration - Actions respect BB.Safety state
 - [ ] Documentation with examples
 - [ ] Tests for action execution and signal bridging
@@ -586,21 +640,28 @@ end
 
 ### API Corrections from Original Proposal
 
-The original proposal's code sketches were written against an older Jido API and an incorrect PubSub message format. The code examples above have been updated to reflect:
+The original proposal's code sketches were written against an older Jido API and an incorrect PubSub message format. The 2026-05-18 revision additionally aligns with Jido v2.0–v2.2 (Skill→Plugin rename, instance-scoped supervision, removal of `actions:` on `use Jido.Agent`, removal of `handle_instruction`/`handle_signal` agent callbacks).
 
 | Issue | Original (incorrect) | Corrected |
 |-------|---------------------|-----------|
-| **Jido version** | `{:jido, "~> 1.2"}` | `{:jido, "~> 2.1"}` — Jido v2 uses `AgentServer`, `Sensor.Runtime`, and `Signal.new!/3` |
+| **Jido version** | `{:jido, "~> 1.2"}` | `{:jido, "~> 2.2"}` — v2.0 instance-scoped supervisors, v2.1 durable scheduler, v2.2 pod architecture |
 | **PubSub message shape** | `{:bb_pubsub, path, message}` | `{:bb, source_path, %BB.Message{}}` — the actual subscriber delivery format |
 | **Command waiting** | Raw `Process.monitor` + `receive` | `BB.Command.await/2` with ResultCache fallback — matches `bb_reactor` Step.Command semantics |
-| **Sensor approach** | `use Jido.Sensor` with `mount/1` + `handle_info/2` | `PubSubBridge` GenServer — Jido v2 sensor runtime uses `init/2` + `handle_event/2` via `Jido.Sensor.Runtime`, which adds unnecessary indirection for PubSub |
+| **Sensor approach** | `use Jido.Sensor` with `mount/1` + `handle_info/2` | `PubSubBridge` GenServer — adds no benefit to wrap PubSub messages already delivered as Erlang messages |
+| **Agent actions** | `use Jido.Agent, actions: [...]` | `use Jido.Agent, plugins: [{BB.Jido.Plugin.Robot, %{robot: MyRobot}}]` — v2 removed the `actions:` option on agents; actions live inside plugins |
+| **Instruction dispatch** | `def handle_instruction(...)` / `Jido.Agent.instruct/2` / `Jido.Agent.run_action/3` | `signal_routes:` map signal types → actions; emit `Jido.Signal` via `AgentServer.cast/2`; agents use `cmd/2` as a pure function |
+| **Signal handling** | `def handle_signal(%Jido.Signal{...}, agent)` on the agent | `Jido.Plugin.handle_signal/2` pre-routing hook; agents themselves stay declarative |
+| **Application supervision** | `{MyRobot.Agent, robot: MyRobot}` directly in the supervision tree | `{Jido, name: MyApp.Jido}` plus `Jido.start_agent(MyApp.Jido, MyRobot.Agent, ...)` |
+| **AI planning** | `Jido.AI.plan(agent, text)` | `Jido.AI.Actions.Planning.Plan` is a regular action; chain via signal routes |
+| **Skills / Plugins** | "Skill" terminology | Renamed to **Plugin** in v2.0-rc.3 |
+| **Built-in action namespace** | `Jido.Actions.*` | `Jido.Tools.*` |
 
 ### Architecture
 
-The recommended approach is **thin wrappers + optional richer plugin layer**:
+Jido v2 forces plugins to v0.1 (you can no longer attach actions directly to an agent). The recommended approach is therefore:
 
-- **v0.1 (thin wrappers):** Direct Jido Action modules (`BB.Jido.Action.*`) that call BB + `bb_reactor` APIs. Matches the "separate package" rationale.
-- **v0.2+ (optional plugin):** A `BB.Jido.Plugin.Robot` owning robot-related agent state (current safety state, last joint state) and centralising routing. Not required initially.
+- **v0.1 (thin wrappers + robot plugin):** `BB.Jido.Action.*` modules call BB and `bb_reactor` directly. `BB.Jido.Plugin.Robot` owns robot-related agent state (safety state, last joint state), default `bb.*` signal routes, and mounts the `PubSubBridge` for its agent.
+- **v0.2+:** Specialised sub-plugins (manipulator, navigation, perception) attach alongside `BB.Jido.Plugin.Robot` to add domain-specific actions and routes.
 
 ```mermaid
 flowchart LR
@@ -692,7 +753,7 @@ Estimates assume one experienced Elixir developer, excluding review/iteration.
 | P0 | `BB.Jido.Action.Reactor` using `Reactor.run/3` | 6–10h | `bb_reactor` context contract |
 | P0 | `BB.Jido.Signal` mapping helper + canonical naming | 6–10h | PubSub format + Jido Signal |
 | P0 | `BB.Jido.PubSubBridge` GenServer with filtering | 10–16h | PubSub subscribe semantics |
-| P0 | `BB.Jido.Agent` macro | 8–12h | Jido v2 agent DSL |
+| P0 | `BB.Jido.Plugin.Robot` plugin (state + default routes + bridge mount) | 8–12h | Jido v2 plugin DSL |
 | P0 | README + 2 complete examples (command + reactor) | 6–10h | Core actions |
 | P1 | `BB.Jido.Action.WaitForState` | 6–10h | `Runtime.state` + PubSub `[:state_machine]` |
 | P1 | Telemetry hooks | 6–10h | — |
@@ -743,7 +804,7 @@ Estimates assume one experienced Elixir developer, excluding review/iteration.
    > See "Testing Strategy" above. Unit tests mock at the BB.Command/Reactor boundary. Integration tests use a simulated robot. E2E tests use an example app.
 
 8. **Jido sensors vs direct PubSub bridge?**
-   > **Recommended (v0.1): PubSubBridge GenServer.** Jido v2 sensor runtime adds indirection that doesn't benefit PubSub messages already delivered as Erlang messages. A Jido Sensor wrapper can be added in v0.2 if desired.
+   > **Resolved (2026-05-18): PubSubBridge GenServer.** Confirmed against Jido v2.2 — the sensor runtime adds indirection that gives no benefit for messages already delivered as Erlang messages. A `Jido.Sensor` wrapper remains a future option but is not blocking.
 
 ---
 
