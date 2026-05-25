@@ -9,13 +9,13 @@ SPDX-License-Identifier: Apache-2.0
 **Status:** Draft
 **Author:** James Harton
 **Created:** 2026-05-24
-**Revised:** 2026-05-25
+**Revised:** 2026-05-26
 
 ---
 
 ## Summary
 
-A perception interface package for Beam Bots that provides the common contract every camera, LIDAR, depth sensor, preprocessing stage, vision-model adapter, and SLAM consumer agrees on. `bb_perception` ships the perception-shaped payload types (`Image`, `LaserScan`, `PointCloud`, `Detections`, etc.), an ETS-backed sample store for high-rate large-payload streams, a `BB.Perception.Perceptor` behaviour for OTP-flavoured processing nodes, a `perceptors` DSL section for wiring sensor streams through processing pipelines, and a `BB.Perception.Health` observable for surfacing degradation. It is intentionally deps-light so driver packages (`bb_camera_*`, `bb_lidar_*`) and heavy adapter packages (`bb_perception_yolo`, `bb_perception_bumblebee`, `bb_perception_ortex`, `bb_perception_hailo`) can depend on a single contract without pulling in EXLA, Ortex, Bumblebee, evision, or vendor NIFs transitively.
+A perception interface package for Beam Bots that provides the common contract every camera, LIDAR, depth sensor, preprocessing stage, vision-model adapter, and SLAM consumer agrees on. `bb_perception` ships the perception-shaped payload types (`Image`, `LaserScan`, `PointCloud`, `Detections`, etc.), an ETS-backed sample store for high-rate large-payload streams, a `perceptors` DSL section for wiring sensor streams through processing pipelines, and `FrameData`-aware payload handling for device-resident data. Perceptor modules implement the `BB.Estimator` behaviour from `bb` core (see [Proposal 0018](0018-bb-estimator.md)) — the `perceptor` DSL entity is a specialised `estimator` entity that adds perception-specific concerns (sample store, FrameData, freshness gating, store-backed outputs). It is intentionally deps-light so driver packages (`bb_camera_*`, `bb_lidar_*`) and heavy adapter packages (`bb_perception_yolo`, `bb_perception_bumblebee`, `bb_perception_ortex`, `bb_perception_hailo`) can depend on a single contract without pulling in EXLA, Ortex, Bumblebee, evision, or vendor NIFs transitively.
 
 Everything in `bb_perception` lives under the `BB.Perception` namespace.
 
@@ -324,7 +324,7 @@ Sensors and perceptors that need sample storage have a hard dependency on `bb_pe
 
 Declared at compile time via the `streams` DSL section (below). Retentions are typed: a `pos_integer` is a count cap, a unit compatible with `:second` is a duration cap, a unit compatible with `:byte` is a memory cap. Multiple retentions of different kinds compose as "any triggers eviction."
 
-The store's overrun behaviour is configured via `on_overrun :ignore | :warn | :degrade`. `:degrade` emits a `BB.Perception.Health` degradation event into the health channel.
+The store's overrun behaviour is configured via `on_overrun :ignore | :warn | :degrade`. For perceptor-owned stores (declared inside a `perceptor` block), `:degrade` counts the overrun toward the owning perceptor's transition-state hysteresis. For sensor-owned stores (declared at the top-level `streams` section), `:degrade` is rejected by the verifier — sensor-owned stores have no perceptor to associate degradation with, so `:degrade` has no defined meaning; use `:warn` (telemetry + log) instead.
 
 Eviction always operates on the oldest unpinned sample. Pinned samples never evict.
 
@@ -357,7 +357,7 @@ streams do
   stream [:sensor, :head, :lidar_top] do
     retention ~u(2 second)
     retention ~u(200 megabyte)
-    on_overrun :degrade
+    on_overrun :warn
   end
 end
 ```
@@ -366,7 +366,7 @@ The `stream` entity:
 
 - Takes a path as its identifying argument.
 - Accepts multiple `retention` declarations (each validated against the union type `{:or, [:pos_integer, unit_type(compatible: :second), unit_type(compatible: :byte)]}`).
-- Accepts a single `on_overrun` option (`:ignore | :warn | :degrade`, default `:ignore`).
+- Accepts a single `on_overrun` option (`:ignore | :warn`, default `:ignore`). `:degrade` is reserved for perceptor-owned stores (declared inline on `perceptor` outputs) and is rejected here.
 
 Paths address the same topics BB pubsub uses. Robot-level sensors (declared in the top-level `sensors` block in `bb`) have paths like `[:sensor, :name]`; link- or joint-attached sensors have paths like `[:sensor, :base_link, :camera_front]`. The verifier resolves both forms.
 
@@ -378,57 +378,15 @@ Paths address the same topics BB pubsub uses. Robot-level sensors (declared in t
 - At least one `retention` declared per stream.
 - No more than one retention per kind (no two byte caps, no two duration caps, no two count caps).
 - All durations and byte values strictly positive.
-- `on_overrun` is one of the allowed atoms.
+- `on_overrun` is `:ignore` or `:warn` (sensor-owned streams may not declare `:degrade`).
 
 Path resolution is pre-cached at compile time via `Spark.Dsl.Transformer.persist/3` so the verifier doesn't re-walk the topology per stream.
 
-### BB.Perception.Perceptor behaviour
+### Perceptor behaviour
 
-A pure callback module, matching the existing pattern for `BB.Sensor`, `BB.Actuator`, and `BB.Controller`. A framework-provided `BB.Perception.Perceptor.Server` wraps the user module with supervision, input subscription, intake freshness gating, multi-input fan-in, output routing, and telemetry.
+Perceptor modules implement `BB.Estimator` (defined in [Proposal 0018](0018-bb-estimator.md)) — the callback contract (`init`, `handle_input`, `handle_info`, `handle_call`, `handle_options`, `terminate`, `options_schema`) is shared between perception and other forms of state estimation. There is no separate `BB.Perception.Perceptor` behaviour; the perception-specific concerns live in the DSL entity and in the framework wrapper (`BB.Perception.Perceptor.Server`).
 
-```elixir
-defmodule BB.Perception.Perceptor do
-  @callback init(opts :: keyword()) ::
-              {:ok, state :: term()}
-              | {:stop, reason :: term()}
-
-  @callback handle_input(
-              input :: BB.Message.t() | %{atom() => BB.Message.t()},
-              state :: term()
-            ) ::
-              {:reply, [{atom(), BB.Message.t()}], state :: term()}
-              | {:noreply, state :: term()}
-              | {:stop, reason :: term(), state :: term()}
-
-  @callback handle_info(msg :: term(), state :: term()) ::
-              {:reply, [{atom(), BB.Message.t()}], state :: term()}
-              | {:noreply, state :: term()}
-              | {:stop, reason :: term(), state :: term()}
-
-  @callback handle_call(req :: term(), from :: GenServer.from(), state :: term()) ::
-              {:reply, reply :: term(), [{atom(), BB.Message.t()}], state :: term()}
-              | {:reply, reply :: term(), state :: term()}
-              | {:noreply, state :: term()}
-              | {:stop, reason :: term(), reply :: term(), state :: term()}
-
-  @callback handle_options(new_opts :: keyword(), state :: term()) ::
-              {:ok, state :: term()} | {:stop, reason :: term()}
-
-  @callback terminate(reason :: term(), state :: term()) :: :ok
-
-  @callback options_schema() :: Spark.Options.t()
-
-  @optional_callbacks [
-    handle_info: 2,
-    handle_call: 3,
-    handle_options: 2,
-    terminate: 2,
-    options_schema: 0
-  ]
-end
-```
-
-The behaviour is intentionally generic. A perceptor might be an inference adapter, a codec, a geometric transform, a fusion node, or anything else that takes one or more input streams and produces one or more output streams. Calling them all "perceptors" reflects how the wider robotics ecosystem groups these stages.
+A perceptor might be an inference adapter, a codec, a geometric transform, a fusion node, or anything else that takes one or more input streams and produces one or more output streams. Calling them all "perceptors" reflects how the wider robotics ecosystem groups these stages — and the `BB.Estimator` contract is general enough to cover both perception and lighter-weight numerical fusion.
 
 #### Reply shape
 
@@ -453,7 +411,7 @@ A YOLO detector:
 
 ```elixir
 defmodule BB.Perception.Vision.Yolo do
-  use BB.Perception.Perceptor,
+  use BB.Estimator,
     options_schema: [
       weights: [type: :string, required: true],
       classes: [type: {:list, :string}, required: true],
@@ -464,13 +422,13 @@ defmodule BB.Perception.Vision.Yolo do
   alias BB.Perception.Message.Detections
   alias BB.Message
 
-  @impl BB.Perception.Perceptor
+  @impl BB.Estimator
   def init(opts) do
     {:ok, model} = YOLO.load_model(weights: opts[:weights], classes: opts[:classes])
     {:ok, %{model: model, opts: opts}}
   end
 
-  @impl BB.Perception.Perceptor
+  @impl BB.Estimator
   def handle_input(%Message{payload: %BB.Perception.Message.Image{} = img} = input, state) do
     detections = YOLO.detect(state.model, img,
       score_threshold: state.opts[:score_threshold],
@@ -488,12 +446,12 @@ An H.265 decoder (pre-processing stage):
 
 ```elixir
 defmodule BB.Perception.Codec.H265 do
-  use BB.Perception.Perceptor
+  use BB.Estimator
 
-  @impl BB.Perception.Perceptor
+  @impl BB.Estimator
   def init(_opts), do: {:ok, %{decoder: H265.new()}}
 
-  @impl BB.Perception.Perceptor
+  @impl BB.Estimator
   def handle_input(%BB.Message{payload: encoded} = input, state) do
     case H265.decode(state.decoder, encoded.data) do
       {:ok, raw_frame} ->
@@ -517,13 +475,13 @@ An accumulating tracker (multi-frame state, emits one tracked-objects message pe
 
 ```elixir
 defmodule BB.Perception.Tracking.SimpleTracker do
-  use BB.Perception.Perceptor,
+  use BB.Estimator,
     options_schema: [window: [type: :pos_integer, default: 5]]
 
-  @impl BB.Perception.Perceptor
+  @impl BB.Estimator
   def init(opts), do: {:ok, %{window: opts[:window], buffer: []}}
 
-  @impl BB.Perception.Perceptor
+  @impl BB.Estimator
   def handle_input(%BB.Message{} = detections, %{buffer: buf, window: n} = state) do
     buffer = [detections | buf] |> Enum.take(n)
     if length(buffer) == n do
@@ -540,15 +498,15 @@ An async inference adapter (Task-based concurrency under model control):
 
 ```elixir
 defmodule BB.Perception.Vision.AsyncYolo do
-  use BB.Perception.Perceptor, options_schema: [weights: [type: :string, required: true]]
+  use BB.Estimator, options_schema: [weights: [type: :string, required: true]]
 
-  @impl BB.Perception.Perceptor
+  @impl BB.Estimator
   def init(opts) do
     {:ok, model} = YOLO.load_model(weights: opts[:weights])
     {:ok, %{model: model, pending: nil}}
   end
 
-  @impl BB.Perception.Perceptor
+  @impl BB.Estimator
   def handle_input(%BB.Message{} = input, state) do
     ref = make_ref()
     parent = self()
@@ -559,7 +517,7 @@ defmodule BB.Perception.Vision.AsyncYolo do
     {:noreply, %{state | pending: ref}}
   end
 
-  @impl BB.Perception.Perceptor
+  @impl BB.Estimator
   def handle_info({:inference_done, ref, input, result}, %{pending: ref} = state) do
     {:ok, msg} = build_detections_msg(input, result)
     {:reply, [out: msg], %{state | pending: nil}}
@@ -573,14 +531,14 @@ end
 
 ### BB.Perception.Perceptor.Server
 
-The framework wrapper. One per perceptor. Responsibilities:
+The framework wrapper, structurally `BB.Estimator.Server` (from Proposal 0018) plus perception-specific concerns. One per perceptor. Responsibilities:
 
 1. **Subscription.** Subscribes to declared input paths via `BB.PubSub.subscribe/3`.
 2. **Intake freshness.** If `now - input.monotonic_time > latency_budget × N` (default N=2), drop with telemetry `[:bb, :perception, :dropped]` and skip dispatch. Models that want raw access can declare `freshness: :off` on the perceptor entity to bypass.
 3. **Multi-input fan-in.** For perceptors with multiple `input` blocks, the driver's arrivals trigger inference; non-driver inputs are pulled via `BB.Perception.SampleStore.nearest/3` keyed off the driver's `monotonic_time`. If any non-driver gap exceeds `sync_tolerance`, drop with telemetry `[:bb, :perception, :dropped]` reason `:sync_miss`.
 4. **Dispatch.** Calls `handle_input/2` with a `BB.Message.t()` (single-input form) or `%{key => BB.Message.t()}` (multi-input form).
 5. **Output routing.** For each `{name, message}` in the reply, looks up `name` in the DSL's declared outputs and publishes to the corresponding topic via `BB.Perception.publish/3` (if store-backed) or `BB.PubSub.publish/3` (if not).
-6. **Health transitions.** Tracks consecutive overruns/successes; on threshold transitions, publishes `BB.Perception.Health` and (if state crossed below `:healthy`) transitions the robot into the configured `degraded_state`.
+6. **Health transitions.** Tracks consecutive overruns/successes with hysteresis. On transitions between `:healthy`, `:degraded`, and `:lost` (the latter detected via GenServer timeout when no input arrives within `lost_after`), invokes the configured `on_degraded`/`on_lost`/`on_recovered` commands. Inherits the transition mechanics defined in Proposal 0018 verbatim; the perception-specific reasons are `:latency_overrun`, `:stale_input`, `:sync_miss`, and `:store_overrun`.
 
 #### v1 limitations
 
@@ -593,11 +551,11 @@ The framework wrapper. One per perceptor. Responsibilities:
 A new top-level section added by `bb_perception`. Declares perceptor processes — their child specs, inputs, outputs, and policy.
 
 ```elixir
-perceptors degraded_state: :degraded do
+perceptors do
   perceptor :front_objects, {BB.Perception.Vision.Yolo, weights: "yolov8n.onnx", classes: :coco} do
     input [:sensor, :base_link, :camera_front]
     latency_budget ~u(50 millisecond)
-    on_overrun :degrade
+    on_degraded :enter_degraded_mode
 
     store retention: ~u(2 second)
   end
@@ -607,7 +565,6 @@ perceptors degraded_state: :degraded do
     input :right, [:sensor, :head, :camera_right]
     latency_budget ~u(100 millisecond)
     sync_tolerance ~u(50 millisecond)
-    on_overrun :warn
   end
 
   perceptor :pose_and_detect, {BB.Perception.Vision.YoloPose, weights: "..."} do
@@ -620,9 +577,7 @@ perceptors degraded_state: :degraded do
 end
 ```
 
-#### Section-level options
-
-- `degraded_state` — atom; the operational state the robot is moved to when any perceptor's health crosses below `:healthy`. Default `:degraded`. The verifier checks this state name exists in the robot's `states do … end` section.
+The `perceptors` section has no section-level options. Per-perceptor transition commands (`on_degraded`, `on_lost`, `on_recovered`) replace what was previously a single section-level `degraded_state` atom. See Proposal 0018 for the transition mechanics; the relevant options carry through to perceptors unchanged.
 
 #### Perceptor entity
 
@@ -634,7 +589,7 @@ perceptor :name, ChildSpec do
 end
 ```
 
-Where `ChildSpec` is either `Module` or `{Module, opts}`. The module must implement `BB.Perception.Perceptor`. Options are validated against the module's `options_schema/0` at compile time (literal values) and again at runtime when parameter references resolve.
+Where `ChildSpec` is either `Module` or `{Module, opts}`. The module must implement `BB.Estimator`. Options are validated against the module's `options_schema/0` at compile time (literal values) and again at runtime when parameter references resolve.
 
 #### Inputs
 
@@ -669,11 +624,11 @@ The model's reply tuples must use names matching declared outputs. Unknown names
 
 #### Latency policy
 
-- `latency_budget` — end-to-end (driver input `monotonic_time` → output published). Required when freshness gating is enabled. Used both for intake drop threshold and for health-monitor overrun detection.
+- `latency_budget` — end-to-end (driver input `monotonic_time` → output published). Required when freshness gating is enabled. Used both for intake drop threshold and for overrun detection feeding the perceptor's transition state machine.
 - `freshness` — `:on | :off`. Default `:on`. When `:off`, the framework dispatches every input regardless of staleness.
-- `on_overrun` — `:ignore | :warn | :degrade`. Default `:ignore`.
-- `lost_after` — number of consecutive budgets without output before health transitions to `:lost`. Default 5. Accepts a parameter reference.
+- `lost_after` — duration unit (or parameter reference). Forwarded to the underlying `BB.Estimator.Server` for GenServer-timeout-based `:lost` detection. Default `5 × latency_budget`.
 - `recover_after` — number of consecutive in-budget completions to transition `:degraded → :healthy`. Default 10. Accepts a parameter reference.
+- `on_degraded` / `on_lost` / `on_recovered` — command names fired on transitions, per Proposal 0018.
 
 #### Chaining
 
@@ -703,72 +658,28 @@ The verifier walks the dependency graph and rejects cycles.
 - Single vs. multi-input form is consistent across all `input` blocks on a perceptor.
 - `driver: true` set on at most one input; required for multi-input perceptors.
 - Non-driver input source streams in multi-input perceptors are store-backed.
-- Perceptor module exists and implements `BB.Perception.Perceptor`.
+- Perceptor module exists and implements `BB.Estimator`.
 - Output topic doesn't collide with any sensor path.
 - `latency_budget` is a positive duration unit when `freshness: :on`.
-- `on_overrun` is one of the allowed atoms.
+- Configured `on_degraded`/`on_lost`/`on_recovered` command names resolve to commands declared in the robot's `commands` section.
 - No cycles in the perceptor dependency graph.
-- Section-level `degraded_state` references an existing state in `states do … end`.
 
-### BB.Perception.Health
+### Health transitions
 
-A first-class observable for perception state. Separate from `BB.Safety` because perception doesn't actuate hardware — it informs decisions. Downstream consumers (commands, controllers, dashboards) subscribe to the health channel and decide their own policy.
+Perception inherits the transition state machine from `BB.Estimator` (Proposal 0018) without modification. Three states (`:healthy`, `:degraded`, `:lost`), hysteresis-debounced transitions, GenServer-timeout-based `:lost` detection, and per-perceptor `on_degraded`/`on_lost`/`on_recovered` command options. There is no separate health payload type, no `BB.Perception.Health` channel, and no health monitor process.
 
-#### States
+Perception-specific transition reasons surfaced to invoked commands:
 
-- `:healthy` — producing output within budget.
-- `:degraded` — overruns, stale inputs, sync misses, or `:degrade` store overruns. Output continues, quality compromised.
-- `:lost` — no output for `lost_after × latency_budget`. Treat as unavailable.
-- `:failed` — supervisor crash detected; recovery underway.
+- `:latency_overrun` — driver input to output exceeded `latency_budget`.
+- `:stale_input` — incoming input older than `latency_budget × N` (intake freshness gate).
+- `:sync_miss` — multi-input synchronisation gap exceeded `sync_tolerance`.
+- `:store_overrun` — a store-backed output's retention triggered eviction with `on_overrun: :degrade`.
 
-Hysteresis prevents flapping: `degraded → healthy` requires `recover_after` consecutive in-budget completions.
+The `allowed_states` mechanism on commands handles state-machine gating for free: a perceptor's `on_degraded` command can transition the robot to a degraded operational state, and other commands' `allowed_states` decide whether to permit operation while degraded. This is the same pattern as Proposal 0018 — perception just inherits it.
 
-#### Health message
+#### Process death
 
-```elixir
-%BB.Perception.Health{
-  state: :healthy | :degraded | :lost | :failed,
-  reasons: [:latency_overrun | :stale_input | :sync_miss |
-            :store_overrun | :no_output | :crashed],
-  since: monotonic_time
-}
-```
-
-Wrapped in a `BB.Message` envelope and published on `[:perception_health, perceptor_name]` (or `[:perception_health, ...sensor_path...]` for store-backed sensors with `:degrade` overrun). Subscribers use BB's existing subtree-matching pubsub.
-
-Continuous metrics (latency percentiles, drop counts, throughput) are emitted as `:telemetry` events via `BB.Telemetry`, not embedded in the Health message. Different consumers, different channels.
-
-#### Monitor
-
-One `BB.Perception.Health.Monitor` GenServer per perceptor (and per store-backed sensor stream with `:degrade` overrun). Lives in the perceptor's supervision subtree. Subscribes to:
-
-- Perceptor server `:input`/`:output`/`:latency` telemetry.
-- Sample store overrun events.
-- Perceptor server process monitor (crash detection).
-- A periodic check for "no output in `lost_after × budget`" → `:lost`.
-
-#### State machine integration
-
-The perceptor server itself drives robot state transitions. When health transitions below `:healthy`, it calls `BB.Robot.Runtime.transition_to(robot, degraded_state)` (idempotent if the robot is already in that state). When health recovers, the server queries `BB.Perception.Health.current/2` for all sibling perceptors; if all are `:healthy`, it transitions the robot back to `:idle`.
-
-This is the singleton-state model: one degraded state for all perception failures, declared at the section level. The existing `allowed_states` mechanism on commands handles command gating for free — commands that should be blocked during degraded operation simply omit `degraded_state` from their `allowed_states`. Commands that should still work in degraded mode (e.g. emergency stop, diagnostics) include it.
-
-There is no separate `BB.Perception.Required` command mix-in. The state machine is the gate.
-
-#### Introspection
-
-Last-known state is queryable without subscribing:
-
-```elixir
-BB.Perception.Health.current(robot, path)
-  #=> {:ok, %BB.Perception.Health{}} | :unknown
-```
-
-Implemented as `GenServer.call(monitor, :current)` in v1; can move to ETS-backed reads later if call latency becomes a concern.
-
-#### Failure handling
-
-When supervisors give up restarting a perceptor (exceeded `max_restarts`), the perceptor's subtree dies and propagates up. The Health.Monitor dies with it — it does not fake a state after its perceptor is permanently dead. Downstream consumers receive the last genuine state message before the cascade (typically `:failed`), then no further messages until the robot is restarted. This is the correct outcome for "things really gone wrong."
+When supervisors give up restarting a perceptor (exceeded `max_restarts`), the perceptor's subtree dies and propagates up via the existing OTP supervision tree. There is no `:failed` health state to publish, by design — process death is an OTP concern, not a state-machine value. Downstream consumers that need to react to perceptor death can monitor the process or subscribe to BB's existing supervision-event channel.
 
 ### Telemetry
 
@@ -854,16 +765,13 @@ bb_perception/
 │   │   │   │   ├── retention.ex
 │   │   │   │   ├── transformers/
 │   │   │   │   └── verifiers/
-│   │   │   ├── perceptor.ex                    # behaviour
-│   │   │   ├── perceptor/server.ex             # framework wrapper
+│   │   │   ├── perceptor/server.ex             # framework wrapper (specialises BB.Estimator.Server)
 │   │   │   ├── perceptor/supervisor.ex
 │   │   │   ├── sample_store.ex                 # public API
 │   │   │   ├── sample_store/
 │   │   │   │   ├── server.ex                   # per-stream owner
 │   │   │   │   ├── retention.ex
 │   │   │   │   └── supervisor.ex
-│   │   │   ├── health.ex
-│   │   │   ├── health/monitor.ex
 │   │   │   ├── message/
 │   │   │   │   ├── image.ex
 │   │   │   │   ├── point_cloud.ex
@@ -888,7 +796,7 @@ bb_perception/
 ```elixir
 defp deps do
   [
-    {:bb, bb_dep("~> 0.13")},
+    {:bb, bb_dep("~> 0.13")},     # provides BB.Estimator behaviour + estimator DSL
     {:spark, "~> 2.0"},
     {:localize, "~> 0.37"},
     {:telemetry, "~> 1.0"}
@@ -896,7 +804,7 @@ defp deps do
 end
 ```
 
-`nx` is inherited transitively via `bb` (which uses it for kinematics and transforms); `bb_perception` adds no further ML inference dependencies. No `ortex`, no `bumblebee`, no `exla`, no `evision`, no vendor NIFs — driver and adapter packages bring those.
+Depends on `bb` for `BB.Estimator` (the perceptor behaviour), the `estimator` DSL entity that the `perceptor` entity specialises, and the transition-state-machine mechanics. `nx` is inherited transitively via `bb` (which uses it for kinematics and transforms); `bb_perception` adds no further ML inference dependencies. No `ortex`, no `bumblebee`, no `exla`, no `evision`, no vendor NIFs — driver and adapter packages bring those.
 
 ### Companion package landscape
 
@@ -971,7 +879,6 @@ defmodule MyRobot do
       {BB.Perception.Vision.Yolo, weights: "priv/yolov8n.onnx", classes: :coco} do
       input [:sensor, :base_link, :camera_front]
       latency_budget ~u(50 millisecond)
-      on_overrun :warn
     end
   end
 end
@@ -1011,7 +918,7 @@ streams do
   stream [:sensor, :base_link, :lidar_top] do
     retention ~u(2 second)
     retention ~u(200 megabyte)
-    on_overrun :degrade
+    on_overrun :warn
   end
 end
 ```
@@ -1036,7 +943,7 @@ perceptors do
     input :right, [:sensor, :head, :camera_right]
     latency_budget ~u(100 millisecond)
     sync_tolerance ~u(20 millisecond)
-    on_overrun :degrade
+    on_degraded :enter_degraded_mode
   end
 end
 ```
@@ -1048,14 +955,17 @@ states do
   state :degraded, doc: "Perception unhealthy; precision motion disabled"
 end
 
-perceptors degraded_state: :degraded do
-  perceptor :obstacle_detection, {BB.Perception.Vision.Obstacles, ...} do
-    input [:sensor, :head, :lidar]
-    latency_budget ~u(100 millisecond)
-  end
-end
-
 commands do
+  command :enter_degraded do
+    handler MyApp.Commands.EnterDegraded   # transitions state machine to :degraded
+    allowed_states [:idle, :executing]
+  end
+
+  command :recover_perception do
+    handler MyApp.Commands.RecoverPerception  # transitions state machine back to :idle
+    allowed_states [:degraded]
+  end
+
   command :pick_object do
     handler MyApp.Commands.PickObject
     allowed_states [:idle]    # not :degraded — auto-gated by state machine
@@ -1066,9 +976,19 @@ commands do
     allowed_states [:idle, :degraded, :executing]
   end
 end
+
+perceptors do
+  perceptor :obstacle_detection, {BB.Perception.Vision.Obstacles, ...} do
+    input [:sensor, :head, :lidar]
+    latency_budget ~u(100 millisecond)
+
+    on_degraded :enter_degraded
+    on_recovered :recover_perception
+  end
+end
 ```
 
-When `:obstacle_detection` degrades, the perceptor server transitions the robot to `:degraded`. `pick_object` is now blocked by the existing `allowed_states` machinery; `emergency_stop` still works. When the perceptor recovers and all sibling perceptors are also healthy, the robot transitions back to `:idle`.
+When `:obstacle_detection` degrades, the perceptor invokes `:enter_degraded`, which transitions the robot to `:degraded`. `pick_object` is now blocked by the existing `allowed_states` machinery; `emergency_stop` still works. When the perceptor recovers, `:recover_perception` runs and transitions the robot back to `:idle`. Policy is entirely the developer's — what counts as "degraded" and what to do about it are encoded in the commands, not the framework.
 
 ---
 
@@ -1089,26 +1009,23 @@ When `:obstacle_detection` degrades, the perceptor server transitions the robot 
 - [ ] `frame_data_field/0` optional callback added to `BB.Message` in `bb`; perception payloads carrying bulk data implement it.
 - [ ] SampleStore byte-cap retention reads payload sizes via `BB.Perception.FrameData.byte_size/1`.
 
-### Phase 2: Perceptor behaviour
+### Phase 2: Perceptor wrapper and DSL
 
-- [ ] `BB.Perception.Perceptor` behaviour with `init`, `handle_input`, `handle_info`, `handle_call`, `handle_options`, `terminate`, `options_schema` callbacks.
-- [ ] `BB.Perception.Perceptor.Server` framework wrapper handles subscription, intake freshness, multi-input fan-in, dispatch, and output routing.
-- [ ] `perceptors` DSL section with `perceptor` entity (sensor-style child_spec), `input` (single + multi-input with driver), `output`, `latency_budget`, `freshness`, `on_overrun`, `sync_tolerance`, inline `store` options.
-- [ ] Section-level `degraded_state` option with verifier check against `states`.
-- [ ] Compile-time verifier for `perceptors` (paths resolve, single-vs-multi consistent, driver constraint, non-driver inputs store-backed, no cycles).
+- [ ] `BB.Perception.Perceptor.Server` specialises `BB.Estimator.Server` (from Proposal 0018) with intake freshness, multi-input fan-in via sample store, store-backed output routing.
+- [ ] `perceptors` DSL section with `perceptor` entity. `perceptor` is a specialised `estimator` entity adding perception-specific options: `freshness`, `sync_tolerance`, `output ... store: [...]`, inline `store` shorthand.
+- [ ] `perceptor` inherits `input`/`output`/`latency_budget`/`lost_after`/`recover_after`/`on_degraded`/`on_lost`/`on_recovered` from `estimator`.
+- [ ] Compile-time verifier for `perceptors` (paths resolve, single-vs-multi consistent, driver constraint, non-driver inputs store-backed, no cycles, command names resolve).
 - [ ] Single-output perceptors publish to `[:perception, perceptor_name]` from reply tuples tagged `:out`.
 - [ ] Multi-output perceptors publish to `[:perception, perceptor_name, name]` per declared output.
 - [ ] Latency budget enforced on intake (drop stale inputs with telemetry).
 - [ ] At least one reference perceptor adapter exists demonstrating the contract.
 
-### Phase 3: Health & state machine integration
+### Phase 3: Transition commands
 
-- [ ] `BB.Perception.Health` payload + monitor process.
-- [ ] State machine with hysteresis (`lost_after`, `recover_after` configurable via DSL + parameters).
-- [ ] Health messages published on `[:perception_health, ...path...]`.
-- [ ] `BB.Perception.Health.current/2` query.
+- [ ] Transition mechanics inherited from `BB.Estimator` (Proposal 0018).
+- [ ] Perception-specific transition reasons surface in command metadata: `:latency_overrun`, `:stale_input`, `:sync_miss`, `:store_overrun`.
+- [ ] Store overruns with `on_overrun: :degrade` count toward the owning perceptor's degradation hysteresis.
 - [ ] Telemetry events: `:input`, `:output`, `:latency`, `:dropped`, `:store_overrun`.
-- [ ] Perceptor server drives robot state transitions: degradation → `degraded_state`, recovery → `:idle` when all siblings healthy.
 
 ### Phase 4: Chaining & polish
 
@@ -1122,8 +1039,6 @@ When `:obstacle_detection` degrades, the perceptor server transitions the robot 
 - [ ] Concrete device-resident `FrameData` implementations (HAILO/CUDA zero-copy). The `BB.Perception.FrameData` protocol ships in v1 so sibling packages (`bb_perception_hailo`, etc.) can add device-resident impls without further changes to `bb_perception`; this proposal does not include any such impl beyond `BitString`.
 - [ ] Cross-node sample store lookups (consumers `:erpc` explicitly if needed).
 - [ ] Hot reload of model weights without restart (perceptors can implement via `handle_call/3` if they want it).
-- [ ] Declarative safety state transitions from health events (a separate controller subscribing to health can do this).
-- [ ] Sample store eviction event publishing (only the per-perceptor health channel surfaces overruns in v1).
 - [ ] Recorded replay support (separate `bb_replay` proposal).
 
 ---
@@ -1142,16 +1057,17 @@ When `:obstacle_detection` degrades, the perceptor server transitions the robot 
 
 6. **Bypassing the store on `BB.Perception.publish/3`.** Some callers might want to publish a message to a store-backed path without storing it (e.g. test injection). Currently the answer is "use `BB.publish/3` directly" but the path is store-backed by definition. Probably leave as-is and revisit if a concrete need emerges.
 
-7. **Degraded-state precedence with multiple robots / multi-perceptor degradation.** Singleton `degraded_state` means any perceptor's degradation transitions to the same target state. If different perceptors should drive different states (e.g. vision fault → `:vision_degraded`, IMU fault → `:imu_degraded`), a future revision can promote `degraded_state` to a per-perceptor option. For v1 the singleton form is enough.
+7. **Cross-perceptor coordination of degraded-state transitions.** With per-perceptor `on_degraded` commands, two perceptors degrading simultaneously could fire two transition commands, each trying to transition the robot to its own degraded state. The existing `allowed_states` mechanism prevents inconsistent transitions, but the resulting behaviour (whichever command fires first wins) may surprise developers. Worth documenting; possibly worth a `coordinated:` option on transition commands in a future revision.
 
 ---
 
 ## References
 
-- [BB.Sensor behaviour](../../bb/lib/bb/sensor.ex) — the pattern this proposal mirrors for `BB.Perception.Perceptor`.
+- [Proposal 0018: BB.Estimator](0018-bb-estimator.md) — defines the behaviour that perceptor modules implement and the transition-state-machine mechanics perception inherits.
+- [BB.Sensor behaviour](../../bb/lib/bb/sensor.ex) — pattern for behaviour-based driver modules.
 - [BB.Message](../../bb/lib/bb/message.ex) — envelope carries `monotonic_time`, `wall_time`, `node`, `frame_id`, `robot`.
 - [BB.PubSub](../../bb/lib/bb/pub_sub.ex) — hierarchical pubsub the perception channel is built on.
-- [BB.Safety](../../bb/lib/bb/safety.ex) — the contract perception health deliberately does not extend.
+- [BB.Safety](../../bb/lib/bb/safety.ex) — the contract perception deliberately does not extend.
 - [Proposal 0003: bb_dataset](0003-bb-dataset.md) — adjacent concern; recording sample streams ties into perception.
 - [yolo_elixir](https://github.com/poeticoding/yolo_elixir) — reference behaviour-based wrapper; informed the original behaviour shape.
 - [Bumblebee + Nx.Serving](https://github.com/elixir-nx/bumblebee) — the batching/distribution model the adapter for it will wrap.
