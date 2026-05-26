@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal 0018: BB.Estimator
 
-**Status:** Draft
+**Status:** Implemented
 **Author:** James Harton
 **Created:** 2026-05-26
 

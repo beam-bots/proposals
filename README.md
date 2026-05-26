@@ -64,4 +64,4 @@ See [template.md](template.md) for the proposal format.
 | [0015](https://github.com/beam-bots/proposals/pull/18) | bb_lua | Proposal | `bb_lua` |
 | [0016](https://github.com/beam-bots/proposals/pull/19) | bb_python | Proposal | `bb_python` |
 | [0017](https://github.com/beam-bots/proposals/pull/20) | bb_perception | Proposal | `bb_perception` |
-| [0018](https://github.com/beam-bots/proposals/pull/21) | BB.Estimator | Accepted | `bb` / `bb_ahrs` |
+| [0018](https://github.com/beam-bots/proposals/pull/21) | BB.Estimator | Implemented | `bb` / `bb_estimator_ahrs` |
