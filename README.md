@@ -65,3 +65,4 @@ See [template.md](template.md) for the proposal format.
 | [0016](https://github.com/beam-bots/proposals/pull/19) | bb_python | Proposal | `bb_python` |
 | [0017](https://github.com/beam-bots/proposals/pull/20) | bb_perception | Proposal | `bb_perception` |
 | [0018](https://github.com/beam-bots/proposals/pull/21) | BB.Estimator | Implemented | `bb` / `bb_estimator_ahrs` |
+| [0020](https://github.com/beam-bots/proposals/pull/27) | cbor_rpc | Proposal | `cbor_rpc` |
