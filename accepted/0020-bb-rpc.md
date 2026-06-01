@@ -4,7 +4,7 @@ SPDX-FileCopyrightText: 2026 James Harton
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Proposal: cbor_rpc
+# Proposal: bb_rpc
 
 **Status:** Draft
 **Author:** James Harton
@@ -14,15 +14,16 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Summary
 
-`cbor_rpc` is a small, extensible, CBOR-based RPC protocol designed to carry
-request/response calls, server-streaming responses, and fire-and-forget
-notifications over any reliable-or-lossy byte stream (UART, TCP, TLS, and
-future datagram transports). The protocol is deliberately **not** Beam Bots
-specific: it ships as a normative wire specification plus three reference
-implementations — Elixir, C/C++, and Rust — sharing a common set of
-conformance vectors. Beam Bots then consumes the Elixir implementation to back
-`BB.Bridge` (remote parameter access) and to forward `BB.PubSub` messages to
-remote peers, but nothing in the wire format depends on BEAM, Elixir, or BB.
+`bb_rpc` is the Beam Bots RPC protocol: a small, extensible, CBOR-based protocol
+that carries request/response calls, server-streaming responses, and
+fire-and-forget notifications over any reliable-or-lossy byte stream (UART, TCP,
+TLS, and future datagram transports). It ships as a normative wire specification
+plus reference implementations in Elixir, C/C++, and Rust, sharing one set of
+conformance vectors. The protocol core carries no dependency on BB types — the
+wire format is reusable on its own — but it is built for and homed in Beam Bots,
+so the Elixir package also ships the `BB.Bridge` and `BB.PubSub` integration that
+motivates it. (It is named `bb_rpc` rather than a generic `cbor-rpc`, which
+already denotes several unrelated projects.)
 
 The envelope is six single-byte opcodes carried as CBOR arrays. Streaming is
 modelled as a response that "keeps the call id open": one call can produce many
@@ -345,16 +346,16 @@ There is no ecosystem-wide transport behaviour, but the established pattern
 plus a protocol state machine. The Elixir implementation defines:
 
 ```elixir
-defmodule CborRpc.Transport do
+defmodule BB.RPC.Transport do
   @moduledoc "Pluggable byte-stream transport; the connection owns framing."
   @callback write(state :: term(), iodata()) :: :ok | {:error, term()}
-  @callback framing() :: module()   # CborRpc.Framing.{Cobs,LengthPrefix}
+  @callback framing() :: module()   # BB.RPC.Framing.{Cobs,LengthPrefix}
   # Inbound bytes arrive at the owning connection as
-  # `{:cbor_rpc_bytes, binary()}` messages.
+  # `{:bb_rpc_bytes, binary()}` messages.
 end
 ```
 
-with concrete implementations `CborRpc.Transport.{Tcp,Tls,Uart}` — each a thin
+with concrete implementations `BB.RPC.Transport.{Tcp,Tls,Uart}` — each a thin
 byte pipe (`:gen_tcp`, `:ssl`, `circuits_uart`) that declares its framing
 (`LengthPrefix` for TCP/TLS, `Cobs` for UART). The connection is a `:gen_statem`
 that owns the correlation table (open ids → awaiting caller or stream handler),
@@ -363,7 +364,8 @@ transports justify the abstraction; it is not speculative.
 
 ### Beam Bots integration (the consumer)
 
-BB does not change the protocol; it sits on top in a separate `bb_rpc` package.
+BB does not change the protocol. The BB-facing modules ship in the same `bb_rpc`
+package, layered on the BB-agnostic protocol core.
 
 **`BB.Bridge` over the wire.** A generic `BB.RPC.Bridge` implements the existing
 `BB.Bridge` behaviour by translating its callbacks into calls:
@@ -394,31 +396,34 @@ from Elixir peers, or as plain strings from others; both resolve via
 
 ## Package Structure
 
-The protocol and its reference implementations live in their own repositories;
-BB integration is a separate package depending on the Elixir implementation.
+The Elixir package is the canonical home for the spec and vectors and holds both
+the BB-agnostic protocol core and the BB integration (the core has no `bb`
+dependency; the bridge and pubsub modules do). Rust and C live in their own
+repositories.
 
 ```
-beam-bots/cbor_rpc/            # canonical home
-├── SPEC.md                    # normative wire specification
-├── vectors/                   # language-neutral conformance vectors
+beam-bots/bb_rpc/             # Elixir package + canonical spec home (namespace BB.RPC)
+├── SPEC.md                   # normative wire specification
+├── vectors/                  # language-neutral conformance vectors
 │   ├── envelope/*.cbor + .json
 │   ├── framing/*.bin
 │   └── typed/*.cbor + .json
-├── lib/cbor_rpc/              # Elixir reference implementation
-│   ├── codec.ex               # envelope encode/decode
-│   ├── typed.ex               # typed-payload tag + registry
-│   ├── framing/{cobs.ex,length_prefix.ex}
-│   ├── transport/{tcp.ex,tls.ex,uart.ex}
-│   ├── connection.ex          # :gen_statem; correlation, timeouts, reconnect
-│   ├── server.ex              # method dispatch + streaming helpers
-│   └── client.ex
-├── test/                      # incl. a runner over vectors/
+├── lib/bb/rpc/
+│   ├── codec.ex              # envelope encode/decode        ┐
+│   ├── typed.ex              # typed-payload + atom tags     │ BB-agnostic
+│   ├── framing/{cobs.ex,length_prefix.ex}                   │ protocol core
+│   ├── transport/{tcp.ex,tls.ex,uart.ex}                    │ (no bb dep)
+│   ├── connection.ex         # :gen_statem; correlation      │
+│   ├── server.ex             # method dispatch + streaming    │
+│   ├── client.ex                                             ┘
+│   ├── bridge.ex             # BB.Bridge over the wire     ┐ BB integration
+│   └── pubsub.ex             # BB.PubSub forwarding        ┘ (depends on bb)
+├── test/                     # incl. a runner over vectors/
 ├── mix.exs
 └── README.md
 
-beam-bots/cbor-rpc-rs/         # Rust reference implementation (crate: cbor-rpc)
-beam-bots/cbor-rpc-c/          # C/C++ reference implementation (no-malloc capable)
-beam-bots/bb_rpc/              # BB integration: BB.RPC.Bridge + PubSub forwarding
+beam-bots/bb-rpc-rs/          # Rust reference implementation (crate: bb-rpc)
+beam-bots/bb-rpc-c/           # C/C++ reference implementation (no-malloc capable)
 ```
 
 ### Candidate dependencies (to be confirmed during implementation)
@@ -442,7 +447,7 @@ as candidates (see Open Questions).
 
 ```elixir
 defmodule MyServer do
-  use CborRpc.Server
+  use BB.RPC.Server
 
   # Unary call
   def handle_call("param.get", [path], _ctx) do
@@ -456,15 +461,15 @@ defmodule MyServer do
   end
 
   def handle_info({:bb, path, %BB.Message{} = msg}, ctx) do
-    CborRpc.Server.partial(ctx, [path, msg])
+    BB.RPC.Server.partial(ctx, [path, msg])
     {:noreply, ctx}
   end
 end
 
-{:ok, conn} = CborRpc.Client.connect(transport: {CborRpc.Transport.Uart,
+{:ok, conn} = BB.RPC.Client.connect(transport: {BB.RPC.Transport.Uart,
   device: "/dev/ttyACM0", speed: 57_600})
-{:ok, value} = CborRpc.Client.call(conn, "param.get", [["motion", "max_speed"]])
-{:ok, _ref}  = CborRpc.Client.stream(conn, "pubsub.subscribe", [["sensor", "imu1"]],
+{:ok, value} = BB.RPC.Client.call(conn, "param.get", [["motion", "max_speed"]])
+{:ok, _ref}  = BB.RPC.Client.stream(conn, "pubsub.subscribe", [["sensor", "imu1"]],
   into: self())
 ```
 
@@ -484,7 +489,7 @@ end
 ### Rust — client
 
 ```rust
-let mut conn = cbor_rpc::Client::connect(Tcp::new("gcs.local:4840")?)?;
+let mut conn = bb_rpc::Client::connect(Tcp::new("gcs.local:4840")?)?;
 let v: f64 = conn.call("param.get", &[&["motion", "max_speed"]])?;
 let mut sub = conn.stream("pubsub.subscribe", &[&["sensor", "imu1"]])?;
 while let Some(msg) = sub.next()? { /* … */ }
@@ -493,11 +498,11 @@ while let Some(msg) = sub.next()? { /* … */ }
 ### C (embedded, no-malloc sketch)
 
 ```c
-crpc_conn conn;
-crpc_init(&conn, &uart_io);                 /* caller supplies byte I/O */
-crpc_call(&conn, "param.get", path_args);   /* writes one framed call  */
-/* in the receive loop: feed bytes, get decoded messages via callback  */
-crpc_feed(&conn, buf, n);                   /* invokes on_message(...)  */
+bbrpc_conn conn;
+bbrpc_init(&conn, &uart_io);                 /* caller supplies byte I/O */
+bbrpc_call(&conn, "param.get", path_args);   /* writes one framed call  */
+/* in the receive loop: feed bytes, get decoded messages via callback   */
+bbrpc_feed(&conn, buf, n);                   /* invokes on_message(...)  */
 ```
 
 ---
@@ -538,27 +543,20 @@ crpc_feed(&conn, buf, n);                   /* invokes on_message(...)  */
 
 ## Open Questions
 
-1. **Name — the generic term is already taken.** `cbor-rpc` names at least three
-   unrelated projects: a Python package ([`cbor-rpc`](https://pypi.org/project/cbor-rpc/)
-   on PyPI), [L-Briand's `CBOR-RPC`](https://github.com/L-Briand/CBOR-RPC), and
-   Go's [`cborrpc`](https://pkg.go.dev/github.com/swiftlobste/go-coordinate/cborrpc).
-   Keeping the working name `cbor_rpc` invites confusion with all three, so pick
-   a **distinctive** name and check hex.pm / crates.io / PyPI availability.
-   (Avoid `CARP` — it collides with an existing networking protocol.)
-2. **CBOR tag numbers** for the typed-payload tag and the atom tag. Pick two in
+1. **CBOR tag numbers** for the typed-payload tag and the atom tag. Pick two in
    the FCFS range (≥ 32768); decide whether to register them with IANA or
    document them as private.
-3. **Rust and C library choices.** Verify current maintenance/versions of
+2. **Rust and C library choices.** Verify current maintenance/versions of
    `minicbor` vs `ciborium`, and `TinyCBOR` vs `QCBOR`, including no-malloc
    behaviour on AVR-class targets.
-4. **Timeouts & in-flight calls across reconnect.** Default request timeout;
+3. **Timeouts & in-flight calls across reconnect.** Default request timeout;
    whether open stream ids survive a transparent reconnect or are torn down.
-5. **CRC choice & placement** for UART frames (CRC-16/CCITT vs CRC-32), and
+4. **CRC choice & placement** for UART frames (CRC-16/CCITT vs CRC-32), and
    whether it is mandatory or negotiated.
-6. **Max frame size** default and whether oversize frames are an error or are
+5. **Max frame size** default and whether oversize frames are an error or are
    chunked at the framing layer (kept separate from streaming `partial`s, which
    are whole values, not fragments).
-7. **Repository layout.** One repo hosting spec + vectors + Elixir impl, or a
+6. **Repository layout.** One repo hosting spec + vectors + Elixir impl, or a
    dedicated spec/vectors repo that all three implementations vendor.
 
 ---
@@ -569,7 +567,7 @@ Several CBOR-based RPC systems already exist. Surveying them validates the shape
 of this design — the same capabilities recur independently — while showing where
 the embedded/lossy-link target leads somewhere none of them go.
 
-| Axis | This proposal | [L-Briand/CBOR-RPC](https://github.com/L-Briand/CBOR-RPC) | [cbor-rpc-py](https://github.com/mesudip/cbor-rpc-py) | [Smithy RPC v2 CBOR](https://smithy.io/2.0/additional-specs/protocols/smithy-rpc-v2-cbor.html) | [go-coordinate cborrpc](https://pkg.go.dev/github.com/swiftlobste/go-coordinate/cborrpc) |
+| Axis | **`bb_rpc`** | [L-Briand/CBOR-RPC](https://github.com/L-Briand/CBOR-RPC) | [cbor-rpc-py](https://github.com/mesudip/cbor-rpc-py) | [Smithy RPC v2 CBOR](https://smithy.io/2.0/additional-specs/protocols/smithy-rpc-v2-cbor.html) | [go-coordinate cborrpc](https://pkg.go.dev/github.com/swiftlobste/go-coordinate/cborrpc) |
 |---|---|---|---|---|---|
 | Envelope | positional array, 6 single-byte opcodes | sequential header list `[vrpc,vapi,id,event,name]` + message + raw payload | undocumented (CBOR, optional JSON) | HTTP POST + CBOR body | map `{id,method,params}` |
 | Correlation | explicit id, per-originator | explicit id; same id usable both ways | bidirectional | implicit (HTTP request/response pair) | explicit id, sequential/non-unique |
