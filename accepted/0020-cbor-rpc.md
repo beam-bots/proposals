@@ -538,10 +538,13 @@ crpc_feed(&conn, buf, n);                   /* invokes on_message(...)  */
 
 ## Open Questions
 
-1. **Name.** Working name `cbor_rpc` (Elixir), `cbor-rpc` (Rust crate),
-   `cbor-rpc-c` (C). Confirm a distinctive brand name and check availability on
-   hex.pm / crates.io and for collisions (note: `CARP` collides with an existing
-   networking protocol; avoid).
+1. **Name — the generic term is already taken.** `cbor-rpc` names at least three
+   unrelated projects: a Python package ([`cbor-rpc`](https://pypi.org/project/cbor-rpc/)
+   on PyPI), [L-Briand's `CBOR-RPC`](https://github.com/L-Briand/CBOR-RPC), and
+   Go's [`cborrpc`](https://pkg.go.dev/github.com/swiftlobste/go-coordinate/cborrpc).
+   Keeping the working name `cbor_rpc` invites confusion with all three, so pick
+   a **distinctive** name and check hex.pm / crates.io / PyPI availability.
+   (Avoid `CARP` — it collides with an existing networking protocol.)
 2. **CBOR tag numbers** for the typed-payload tag and the atom tag. Pick two in
    the FCFS range (≥ 32768); decide whether to register them with IANA or
    document them as private.
@@ -557,6 +560,54 @@ crpc_feed(&conn, buf, n);                   /* invokes on_message(...)  */
    are whole values, not fragments).
 7. **Repository layout.** One repo hosting spec + vectors + Elixir impl, or a
    dedicated spec/vectors repo that all three implementations vendor.
+
+---
+
+## Prior art
+
+Several CBOR-based RPC systems already exist. Surveying them validates the shape
+of this design — the same capabilities recur independently — while showing where
+the embedded/lossy-link target leads somewhere none of them go.
+
+| Axis | This proposal | [L-Briand/CBOR-RPC](https://github.com/L-Briand/CBOR-RPC) | [cbor-rpc-py](https://github.com/mesudip/cbor-rpc-py) | [Smithy RPC v2 CBOR](https://smithy.io/2.0/additional-specs/protocols/smithy-rpc-v2-cbor.html) | [go-coordinate cborrpc](https://pkg.go.dev/github.com/swiftlobste/go-coordinate/cborrpc) |
+|---|---|---|---|---|---|
+| Envelope | positional array, 6 single-byte opcodes | sequential header list `[vrpc,vapi,id,event,name]` + message + raw payload | undocumented (CBOR, optional JSON) | HTTP POST + CBOR body | map `{id,method,params}` |
+| Correlation | explicit id, per-originator | explicit id; same id usable both ways | bidirectional | implicit (HTTP request/response pair) | explicit id, sequential/non-unique |
+| Symmetric / bidirectional | yes | yes | yes | no (client→server) | pipelined, client→server |
+| Streaming / push | id-correlated `partial`s + `seq` | separate raw payload field; notifications | log/progress streaming, topic events | Amazon event-stream (chunked) | none |
+| Drop detection | per-stream `seq` (wrap 2⁸) | none | none | n/a (reliable HTTP) | none |
+| Error model | JSON-RPC codes + `data` | none (custom event+name) | — | `__type` Shape-ID + `message` | `error.message` |
+| Extensibility | typed-payload + atom CBOR tags | custom event types | — | Smithy model shapes | ad-hoc CBOR tags |
+| Byte-stream framing | COBS (UART) / length-prefix (TCP/TLS) | 3-part concat (assumes msg-preserving channel) | buffering transformer | HTTP / event-stream | CBOR-in-CBOR (tag 24) |
+| Target | embedded UART → TCP/TLS | WebSocket / BT / TCP | TCP / SSH / stdio | HTTP services (AWS) | daemon socket |
+
+**What recurs (and so validates the design).** Bidirectional symmetry
+(cbor-rpc-py, L-Briand), per-call cancellation and topic/progress streaming
+(cbor-rpc-py), pluggable transport with a buffering framer (both), and explicit
+ids reused in both directions all appear independently. L-Briand's "both sides
+may use the same id" is precisely our per-originator id space.
+
+**What is distinctive here.** Two properties none of the four have, both falling
+out of the embedded target the others don't share: **per-stream `seq` drop
+detection** and **COBS framing**. Every surveyed system rides a
+message-preserving transport (HTTP, WebSocket, a reliable socket), so none needs
+to detect dropped frames or delimit a frameless UART. This proposal treats the
+AVR-over-UART case as first-class, which is what forces both. The single-byte
+positional opcodes are also the most compact envelope of the group (versus maps,
+named keys, or a protocol version on every message), and the atom tag is unique
+to the Elixir-fidelity requirement.
+
+**Ideas considered.** L-Briand carries large raw blobs in a payload field
+*outside* the structured CBOR; we embed them (e.g. `Image` data as a CBOR byte
+string), which carries no nesting penalty since CBOR byte strings are
+length-prefixed with no escaping. Smithy encodes timestamps as CBOR tag 1; our
+`BB.Message` times are nanosecond integers, so no dedicated time tag is needed.
+
+**Smithy RPC v2 CBOR** is the useful contrast at the other end of the spectrum:
+schema-first, HTTP-bound, codegen-driven, correlation implicit in the HTTP pair.
+It is the right design for large-scale web services (AWS uses it) and the wrong
+one for a UART link to a microcontroller — which is exactly why this protocol
+exists alongside it rather than adopting it.
 
 ---
 
