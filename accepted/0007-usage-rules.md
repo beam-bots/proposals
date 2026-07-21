@@ -1,6 +1,6 @@
 # Proposal: Usage Rules for Beam Bots Packages
 
-**Status:** Draft
+**Status:** Accepted
 **Author:** James Harton
 **Created:** 2026-01-13
 
