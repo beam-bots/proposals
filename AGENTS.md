@@ -27,10 +27,12 @@ The next proposal number is one higher than the highest existing proposal number
 ### 2. Create the Proposal File
 
 1. Copy `template.md` to `accepted/NNNN-feature-name.md`
-2. Add the SPDX license header at the top:
+2. Add the SPDX license header at the top, crediting **the user you are working
+   for** (take their name from `git config user.name`, use the current year) —
+   not the agent, and not whoever authored an existing proposal you copied from:
    ```markdown
    <!--
-   SPDX-FileCopyrightText: 2026 James Harton
+   SPDX-FileCopyrightText: <current year> <your user's name>
 
    SPDX-License-Identifier: Apache-2.0
    -->
@@ -86,3 +88,5 @@ proposals/
 ## REUSE Compliance
 
 All files must have SPDX license headers. For markdown files, use HTML comments at the top of the file. For files that don't support comments (like `.json`), create a companion `.license` file.
+
+When you create a file, its `SPDX-FileCopyrightText` line must credit **the user you are working for** — take their name from `git config user.name`, use the current year — not you the agent, and not the repo's original author. Never copy an existing file's copyright line onto a new file.
