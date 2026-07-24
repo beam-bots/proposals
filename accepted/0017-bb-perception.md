@@ -9,13 +9,15 @@ SPDX-License-Identifier: Apache-2.0
 **Status:** Draft
 **Author:** James Harton
 **Created:** 2026-05-24
-**Revised:** 2026-05-26
+**Revised:** 2026-07-22
 
 ---
 
 ## Summary
 
-A perception interface package for Beam Bots that provides the common contract every camera, LIDAR, depth sensor, preprocessing stage, vision-model adapter, and SLAM consumer agrees on. `bb_perception` ships the perception-shaped payload types (`Image`, `LaserScan`, `PointCloud`, `Detections`, etc.), an ETS-backed sample store for high-rate large-payload streams, a `perceptors` DSL section for wiring sensor streams through processing pipelines, and `FrameData`-aware payload handling for device-resident data. Perceptor modules implement the `BB.Estimator` behaviour from `bb` core (see [Proposal 0018](0018-bb-estimator.md)) — the `perceptor` DSL entity is a specialised `estimator` entity that adds perception-specific concerns (sample store, FrameData, freshness gating, store-backed outputs). It is intentionally deps-light so driver packages (`bb_camera_*`, `bb_lidar_*`) and heavy adapter packages (`bb_perception_yolo`, `bb_perception_bumblebee`, `bb_perception_ortex`, `bb_perception_hailo`) can depend on a single contract without pulling in EXLA, Ortex, Bumblebee, evision, or vendor NIFs transitively.
+A perception interface package for Beam Bots that provides the common contract every camera, LIDAR, depth sensor, preprocessing stage, vision-model adapter, and SLAM consumer agrees on. `bb_perception` ships perception-shaped payload types (`Image`, `LaserScan`, `PointCloud`, `Detections`, etc.), an ETS-backed sample store for high-rate large-payload streams, a thin `perceptors` DSL for wiring processing pipelines through the existing `BB.Estimator` runtime, and `FrameData`-aware handling for device-resident data. It does not define a second processing behaviour, server, health state machine, or telemetry contract: every perceptor implements `BB.Estimator` and runs in `BB.Estimator.Server`. Store-backed outputs use `BB.Perception.publish/3`, which stores the canonical message envelope before publishing that same envelope through `BB.PubSub`.
+
+The package is intentionally deps-light so driver packages (`bb_camera_*`, `bb_lidar_*`) and heavy adapter packages (`bb_perception_yolo`, `bb_perception_bumblebee`, `bb_perception_ortex`, `bb_perception_hailo`) can depend on a single contract without pulling in EXLA, Ortex, Bumblebee, evision, or vendor NIFs transitively.
 
 Everything in `bb_perception` lives under the `BB.Perception` namespace.
 
@@ -56,7 +58,7 @@ Out of scope:
 - SLAM algorithms (`bb_slam_*`) — depend on this package, separate proposals.
 - `bb_replay` (record/replay of sample streams) — separate proposal.
 - Cross-node sample store lookups — consumers `:erpc` explicitly if needed.
-- Concrete device-resident frame data implementations (HAILO/CUDA buffers) — the `BB.Perception.FrameData` protocol defining the contract ships in v1; the device-specific implementations live in sibling adapter packages.
+- Concrete device-resident frame data implementations (HAILO/CUDA buffers) — the `BB.Perception.FrameData` protocol and ownership contract ship in v1; device-specific implementations live in sibling adapter packages.
 
 ---
 
@@ -69,13 +71,13 @@ Out of scope:
 │                        bb_perception                            │
 │                                                                 │
 │  ┌────────────────┐  ┌──────────────────┐  ┌────────────────┐   │
-│  │ Payload Types  │  │   SampleStore    │  │   Perceptor    │   │
-│  │  (structs)     │  │  (per-stream)    │  │   (behaviour)  │   │
-│  └────────────────┘  └──────────────────┘  └────────────────┘   │
-│                                                                 │
-│  ┌────────────────┐  ┌──────────────────┐                       │
-│  │  Dsl extension │  │ Perception.Health│                       │
-│  │  (sections)    │  │  (observable)    │                       │
+│  │ Payload Types  │  │   SampleStore    │  │ Perceptors DSL │   │
+│  │  (structs)     │  │  (per-stream)    │  │ (thin adapter) │   │
+│  └────────────────┘  └──────────────────┘  └───────┬────────┘   │
+│                                                    │ lowers to  │
+│  ┌────────────────┐  ┌──────────────────┐          ▼            │
+│  │   FrameData    │  │ Perception.publish│  BB.Estimator entity │
+│  │   protocol     │  │ store → PubSub    │  + Server (in core)  │
 │  └────────────────┘  └──────────────────┘                       │
 └─────────────────────────────────────────────────────────────────┘
         ↑                       ↑                       ↑
@@ -91,7 +93,7 @@ Out of scope:
 
 `BB.Message.Sensor.Image` and `BB.Message.Sensor.LaserScan` currently live in `bb`. Nothing in core machinery consumes them. They were added in anticipation of perception work and are misplaced. This proposal moves both into `bb_perception` as `BB.Perception.Message.Image` and `BB.Perception.Message.LaserScan` as part of the same release.
 
-This is a breaking change for any external code that referenced these modules in `bb`, but since neither type is consumed by any current code path or sibling package, the migration cost is "rewrite one `alias` line." It will be flagged in `bb`'s changelog and called out in the `bb_perception` migration guide.
+This is a breaking change for external code that references either module. No current sibling package uses them, but external use cannot be assumed away: the move requires a coordinated `bb` release, changelog entry, and `bb_perception` migration guide covering both module names and the `FrameData`-based bulk fields.
 
 ### Payload types
 
@@ -121,7 +123,22 @@ BB.Perception.Message.Classification # class label(s) with confidence
 
 Each is a `use BB.Message`-derived module with a Spark-validated schema. Shapes follow ROS `sensor_msgs` / `vision_msgs` precedent where applicable.
 
-Message identity uses the envelope's existing `monotonic_time` field — no new id field is introduced. This is sufficient because sample stores are local to the producing node, and `monotonic_time` collisions are avoided by `insert_new` (see SampleStore).
+#### Numeric array convention
+
+Bulk numerical arrays use typed, shaped `Nx.Tensor` values rather than lists of floats or untyped binaries. The tensor preserves element type and shape while payload fields provide semantic metadata such as units, axis names, point-field descriptors, or image encoding:
+
+| Payload field | V1 representation |
+|---|---|
+| `LaserScan.ranges` / `intensities` | rank-1 `{:f, 32}` tensor |
+| `PointCloud.points` | rank-2 tensor plus point-field descriptors |
+| `Depth.data` / `DepthMap.data` | rank-2 tensor; payload declares units/encoding |
+| `Masks.data` | rank-3 boolean or `{:u, 8}` tensor |
+| `Keypoints.data` | tensor whose final axis carries coordinates/confidence |
+| `Embedding.data` | rank-1 floating-point tensor |
+
+Encoded byte streams, such as compressed images, remain binaries with an explicit payload encoding. Decoded images may use either a binary with width/height/stride metadata or a shaped tensor, according to their encoding. Bulk numeric fields do not use `[float()]`; moving the current `LaserScan` shape is therefore a data-schema migration, not only a module rename.
+
+Message identity uses the canonical stored envelope's `monotonic_time` field; no new id field is introduced. Sample stores are local to the producing node. If insertion resolves a timestamp collision, the adjusted envelope becomes canonical and the same envelope is subsequently delivered to PubSub subscribers.
 
 ### Frame data carriers
 
@@ -150,8 +167,8 @@ defprotocol BB.Perception.FrameData do
 end
 
 defimpl BB.Perception.FrameData, for: BitString do
-  def to_iodata(b), do: b
-  def byte_size(b), do: Kernel.byte_size(b)
+  def to_iodata(binary) when is_binary(binary), do: binary
+  def byte_size(binary) when is_binary(binary), do: Kernel.byte_size(binary)
   def residency(_), do: :host
 end
 ```
@@ -172,17 +189,33 @@ defmodule BB.Perception.Message.Image do
     ]
 
   @impl BB.Message
-  def frame_data_field, do: :data
+  def frame_data_fields, do: [:data]
 
   def validate_frame_data(value, _opts) do
-    if BB.Perception.FrameData.impl_for(value),
-      do: {:ok, value},
-      else: {:error, "expected a value implementing BB.Perception.FrameData"}
+    cond do
+      is_binary(value) ->
+        {:ok, value}
+
+      is_bitstring(value) ->
+        {:error, "expected a byte-aligned binary"}
+
+      BB.Perception.FrameData.impl_for(value) ->
+        {:ok, value}
+
+      true ->
+        {:error, "expected a value implementing BB.Perception.FrameData"}
+    end
   end
 end
 ```
 
-`frame_data_field/0` is an optional callback added to `BB.Message` in `bb` core; the callback returns the atom name of the field that carries `FrameData`, or `nil` for payloads with no bulk data (the default). `bb` itself doesn't act on the value — `bb_perception` is the consumer, and other future systems (`bb_replay`, dataset tooling) can opt in independently.
+`frame_data_fields/0` is an optional callback added to `BB.Message` in `bb` core. It returns every field containing a `FrameData` carrier and defaults to `[]`. A list supports payloads such as stereo pairs or masks without a later callback change. `bb` itself doesn't act on the values — `bb_perception` is the consumer, and other future systems (`bb_replay`, dataset tooling) can opt in independently. The built-in `BitString` implementation accepts byte-aligned binaries only because arbitrary bitstrings are not valid iodata.
+
+V1 also implements `FrameData` for `Nx.Tensor`. `to_iodata/1` materialises tensor data through `Nx.to_binary/1`, `byte_size/1` derives logical bytes from the tensor shape and element type without forcing a device-to-host copy, and `residency/1` reports `:host` for the binary backend or the corresponding device backend. Adapters needing a stable zero-copy device handle use their own carrier struct rather than relying on Nx backend internals.
+
+#### Carrier lifetime
+
+A device-resident carrier must own a BEAM-managed reference to its underlying buffer. The bytes and device handle remain valid for as long as the carrier term is reachable, including through ETS, subscriber mailboxes, and pinned samples; resource release occurs through the carrier's NIF/resource destructor after the final reference is collected. Borrowed handles that a driver may recycle while the term remains reachable do not satisfy `FrameData` and must copy into an owning carrier before publication. The protocol deliberately has no explicit `release/1`: one consumer cannot invalidate data still retained by another.
 
 #### Consumer pattern
 
@@ -242,16 +275,19 @@ The SampleStore uses the protocol for byte-cap retention:
 ```elixir
 defp payload_byte_size(%BB.Message{payload: payload}) do
   mod = payload.__struct__
-  with true <- function_exported?(mod, :frame_data_field, 0),
-       field when not is_nil(field) <- mod.frame_data_field() do
-    BB.Perception.FrameData.byte_size(Map.get(payload, field))
+
+  if function_exported?(mod, :frame_data_fields, 0) do
+    mod.frame_data_fields()
+    |> Enum.reduce(0, fn field, total ->
+      total + BB.Perception.FrameData.byte_size(Map.fetch!(payload, field))
+    end)
   else
-    _ -> 0
+    0
   end
 end
 ```
 
-Payloads with no `frame_data_field/0` (or returning `nil`) contribute zero to byte-cap accounting — they're still subject to count and duration caps.
+Payloads with no `frame_data_fields/0` callback, or returning `[]`, contribute zero to byte-cap accounting — they're still subject to count and duration caps.
 
 ### SampleStore
 
@@ -263,13 +299,13 @@ A "stream" is addressed by `(robot, path)` where `path` is the same hierarchical
 
 #### Storage shape
 
-Samples are stored as `BB.Message` values directly — no parallel sample struct. The envelope already carries `monotonic_time`, `wall_time`, `node`, `frame_id`, `payload`, and `robot`. ETS table is `:ordered_set` on `monotonic_time` with `read_concurrency: true` and `write_concurrency: false`.
+Samples are stored as `{monotonic_time, %BB.Message{}}` tuples — no parallel sample struct. ETS requires tuple objects and uses the first element as the `:ordered_set` key; the envelope remains the canonical returned value and already carries `monotonic_time`, `wall_time`, `node`, `frame_id`, `payload`, and `robot`. The table enables `read_concurrency: true` and keeps `write_concurrency: false` because its server serialises writes.
 
-Refc binaries (camera frame data, point clouds) are shared by reference between ETS and any subscriber that received the message via pubsub — no copy.
+Within the local BEAM, refc binaries (camera frame data, point clouds) are shared by reference between ETS and PubSub subscribers — no per-subscriber binary copy.
 
 #### Collision avoidance
 
-`System.monotonic_time(:nanosecond)` is strictly monotonic per scheduler but not across processes. To avoid silent overwrites when two messages from different processes share a `monotonic_time`, the server uses `:ets.insert_new/2`. On collision it increments by 1ns and retries (in practice almost never triggered; the second ETS op is cheap when it does). The stored `monotonic_time` reflects the value actually used as the key, which may differ from `System.monotonic_time/0` at construction by a handful of nanoseconds in pathological cases.
+`System.monotonic_time(:nanosecond)` is strictly monotonic per scheduler but not across processes. To avoid silent overwrites when two messages share a `monotonic_time`, the server uses `:ets.insert_new/2`. On collision it increments the timestamp by 1ns and retries. The server returns the adjusted canonical envelope to `BB.Perception.publish/3`; that exact value is both retained and published.
 
 #### Read API
 
@@ -296,7 +332,7 @@ BB.Perception.SampleStore.since(robot, path, time_or_message)
   #=> [%BB.Message{}]
 ```
 
-`id` is the sample's `monotonic_time` (integer). Time arguments polymorphically accept either an integer `monotonic_time` or a `BB.Message.t()` (whose `monotonic_time` is used). Lookups are direct `:ets.select` calls with match specs on the key — O(log n) on the ordered_set, no allocation. `nearest` ties break in favour of the earlier sample (causal, no future-data leakage).
+`id` is the sample's canonical `monotonic_time` (integer). Time arguments polymorphically accept either an integer timestamp or a `BB.Message.t()`. Point and nearest-neighbour lookups use ordered-set key traversal (`:ets.prev/2` and `:ets.next/2`); range operations use match specifications. `nearest` ties break in favour of the earlier sample to avoid future-data leakage.
 
 #### Pinning
 
@@ -308,15 +344,25 @@ BB.Perception.SampleStore.unpin(robot, path, id)  #=> :ok
 BB.Perception.SampleStore.pinned(robot, path)     #=> [%BB.Message{}]
 ```
 
-Pinned samples are exempt from all retention policies.
+Pinned samples are exempt from all retention policies. `stats/2` reports pinned count and bytes. If insertion cannot satisfy every configured cap after evicting all eligible older samples, the server removes the newly inserted sample, returns `BB.Perception.Error.StoreOverrun`, and publishes nothing; it does not remain silently over cap or publish an envelope that is no longer stored. Pin ownership and automatic release remain open design questions; callers must unpin samples they no longer need.
 
 #### Write API
 
 ```elixir
-BB.Perception.publish(robot, path, message)  #=> :ok | {:error, :no_store}
+BB.Perception.publish(robot, path, message)
+#=> :ok | {:error, BB.Error.t()}
 ```
 
-`publish/3` writes to the configured store (setting `:robot` on the envelope before insert) and then dispatches via `BB.PubSub.publish/3`. It is a strict superset of `BB.publish/3` for store-backed paths; calling it on a path without a declared store returns `{:error, :no_store}` rather than falling through silently.
+`publish/3` provides store-before-publish ordering for a declared local stream:
+
+1. Resolve the store for `(robot, path)`; a missing declaration returns `BB.Perception.Error.NoStore`.
+2. Set `message.robot` before insertion.
+3. Insert synchronously, resolve any timestamp collision, and run retention accounting.
+4. If storage fails, return the error and publish nothing.
+5. Publish the exact canonical stored envelope through `BB.PubSub.publish/3` only after insertion succeeds.
+6. If PubSub raises, leave the canonical envelope stored and surface the publication failure. Storage is not rolled back and retry is not idempotent.
+
+A subscriber therefore never receives an envelope that failed storage, although the converse is not guaranteed: an envelope can remain stored after PubSub failure, and normal retention may evict it later. Direct `BB.PubSub.publish/3` on a declared store-backed path bypasses storage and is unsupported; the framework does not globally intercept PubSub.
 
 Sensors and perceptors that need sample storage have a hard dependency on `bb_perception` and use `BB.Perception.publish/3` for their store-backed outputs. The same driver can still call `BB.publish/3` directly for incidental messages that aren't sample-store backed (e.g. a camera publishing its own onboard temperature reading). Drivers with no store-backed outputs don't need to depend on `bb_perception` at all.
 
@@ -324,7 +370,9 @@ Sensors and perceptors that need sample storage have a hard dependency on `bb_pe
 
 Declared at compile time via the `streams` DSL section (below). Retentions are typed: a `pos_integer` is a count cap, a unit compatible with `:second` is a duration cap, a unit compatible with `:byte` is a memory cap. Multiple retentions of different kinds compose as "any triggers eviction."
 
-The store's overrun behaviour is configured via `on_overrun :ignore | :warn | :degrade`. For perceptor-owned stores (declared inside a `perceptor` block), `:degrade` counts the overrun toward the owning perceptor's transition-state hysteresis. For sensor-owned stores (declared at the top-level `streams` section), `:degrade` is rejected by the verifier — sensor-owned stores have no perceptor to associate degradation with, so `:degrade` has no defined meaning; use `:warn` (telemetry + log) instead.
+Duration retention is measured in stream time from the newest canonical sample's `monotonic_time`, not from wall time. A stopped stream therefore retains its final window until another sample arrives; duration retention is not a wall-clock TTL.
+
+The store's overrun behaviour is configured via `on_overrun :ignore | :warn`. Retention and pin-pressure events belong to the store, not the estimator health state machine. Both settings return insertion failure when caps cannot be met; `:warn` additionally emits a log entry. Store-overrun telemetry is always emitted.
 
 Eviction always operates on the oldest unpinned sample. Pinned samples never evict.
 
@@ -341,7 +389,7 @@ BB.Perception.SampleStore.stats(robot, path)
 
 #### Distribution
 
-Stores are strictly local to the producing node. Cross-node consumers subscribe via pubsub for sample arrival events; if they need point-in-time lookups (e.g. for fusion), they perform `:erpc` calls against the producing node's store explicitly. The store API does not auto-RPC, to keep latency behaviour honest.
+Stores and BB PubSub are strictly local to the producing node. Cross-node transport requires an explicit bridge outside this proposal. A remote process that already knows the producing node may perform an `:erpc` store lookup, but the store API does not auto-RPC and no cross-node subscription is implied.
 
 ### Streams DSL section
 
@@ -366,9 +414,11 @@ The `stream` entity:
 
 - Takes a path as its identifying argument.
 - Accepts multiple `retention` declarations (each validated against the union type `{:or, [:pos_integer, unit_type(compatible: :second), unit_type(compatible: :byte)]}`).
-- Accepts a single `on_overrun` option (`:ignore | :warn`, default `:ignore`). `:degrade` is reserved for perceptor-owned stores (declared inline on `perceptor` outputs) and is rejected here.
+- Accepts a single `on_overrun` option (`:ignore | :warn`, default `:ignore`).
 
 Paths address the same topics BB pubsub uses. Robot-level sensors (declared in the top-level `sensors` block in `bb`) have paths like `[:sensor, :name]`; link- or joint-attached sensors have paths like `[:sensor, :base_link, :camera_front]`. The verifier resolves both forms.
+
+The perception DSL transformer contributes a robot-scoped store supervisor through core's extension-child hook. Store children start before topology producers, so a correctly declared camera or perceptor cannot race its store during normal robot startup. They terminate with that robot and are never discovered through application-global state.
 
 #### Compile-time verifier
 
@@ -378,13 +428,13 @@ Paths address the same topics BB pubsub uses. Robot-level sensors (declared in t
 - At least one `retention` declared per stream.
 - No more than one retention per kind (no two byte caps, no two duration caps, no two count caps).
 - All durations and byte values strictly positive.
-- `on_overrun` is `:ignore` or `:warn` (sensor-owned streams may not declare `:degrade`).
+- `on_overrun` is `:ignore` or `:warn`.
 
 Path resolution is pre-cached at compile time via `Spark.Dsl.Transformer.persist/3` so the verifier doesn't re-walk the topology per stream.
 
-### Perceptor behaviour
+### Perceptors as estimators
 
-Perceptor modules implement `BB.Estimator` (defined in [Proposal 0018](0018-bb-estimator.md)) — the callback contract (`init`, `handle_input`, `handle_info`, `handle_call`, `handle_options`, `terminate`, `options_schema`) is shared between perception and other forms of state estimation. There is no separate `BB.Perception.Perceptor` behaviour; the perception-specific concerns live in the DSL entity and in the framework wrapper (`BB.Perception.Perceptor.Server`).
+Perceptor modules implement `BB.Estimator` from `bb` core. The callback contract (`init`, `handle_input`, `handle_info`, `handle_call`, `handle_options`, `terminate`, `options_schema`) is shared between perception and other forms of state estimation. There is no `BB.Perception.Perceptor` behaviour and no perception-specific server.
 
 A perceptor might be an inference adapter, a codec, a geometric transform, a fusion node, or anything else that takes one or more input streams and produces one or more output streams. Calling them all "perceptors" reflects how the wider robotics ecosystem groups these stages — and the `BB.Estimator` contract is general enough to cover both perception and lighter-weight numerical fusion.
 
@@ -397,11 +447,11 @@ Perceptors emit messages by returning `{:reply, [{output_name, %BB.Message{}}], 
 
 Returning an empty list emits nothing; useful for accumulators that consume many inputs before producing one output. The model can return any combination of names in any callback.
 
-The framework injects `:robot` and stamps the published path on dispatch (same behaviour as `BB.PubSub.publish/3`). Models are responsible for `frame_id`, `payload`, and any temporal anchoring (e.g. carrying through the driver input's `monotonic_time` if the model wants telemetry to correlate output latency to that input).
+The publisher injects `:robot`; the source path is delivered separately in the PubSub tuple and is not stored in the envelope. Models are responsible for `frame_id`, `payload`, and any temporal anchoring they need.
 
 #### Type checking
 
-There are no `input_kinds` / `output_kinds` callbacks. The model is trusted to construct correctly-typed payloads. Type errors surface at message construction time via `BB.Message.new/2`'s Spark.Options validation — payloads that don't validate against their schema raise on construction.
+There are no `input_kinds` / `output_kinds` callbacks. The model is trusted to construct correctly-typed payloads. `BB.Message.new/3` returns validation errors from Spark.Options; callers that deliberately want raising behaviour use `BB.Message.new!/3`.
 
 Downstream consumers (perceptors with `input [:perception, :other_perceptor]`, or pubsub subscribers with `message_types:`) get type-matching at runtime. The static contract is "you said this perceptor produces detections; if you publish masks instead, your consumers will reject them."
 
@@ -529,26 +579,34 @@ defmodule BB.Perception.Vision.AsyncYolo do
 end
 ```
 
-### BB.Perception.Perceptor.Server
+### Runtime reuse
 
-The framework wrapper, structurally `BB.Estimator.Server` (from Proposal 0018) plus perception-specific concerns. One per perceptor. Responsibilities:
+The `perceptors` DSL is syntax over the existing estimator runtime. At compile time each `perceptor` is lowered to a robot-level `BB.Dsl.Estimator` configuration with perception output paths. At runtime every perceptor is a `BB.Estimator.Server`; `bb_perception` does not copy, wrap, proxy, or specialise that server.
 
-1. **Subscription.** Subscribes to declared input paths via `BB.PubSub.subscribe/3`.
-2. **Intake freshness.** If `now - input.monotonic_time > latency_budget × N` (default N=2), drop with telemetry `[:bb, :perception, :dropped]` and skip dispatch. Models that want raw access can declare `freshness: :off` on the perceptor entity to bypass.
-3. **Multi-input fan-in.** For perceptors with multiple `input` blocks, the driver's arrivals trigger inference; non-driver inputs are pulled via `BB.Perception.SampleStore.nearest/3` keyed off the driver's `monotonic_time`. If any non-driver gap exceeds `sync_tolerance`, drop with telemetry `[:bb, :perception, :dropped]` reason `:sync_miss`.
-4. **Dispatch.** Calls `handle_input/2` with a `BB.Message.t()` (single-input form) or `%{key => BB.Message.t()}` (multi-input form).
-5. **Output routing.** For each `{name, message}` in the reply, looks up `name` in the DSL's declared outputs and publishes to the corresponding topic via `BB.Perception.publish/3` (if store-backed) or `BB.PubSub.publish/3` (if not).
-6. **Health transitions.** Tracks consecutive overruns/successes with hysteresis. On transitions between `:healthy`, `:degraded`, and `:lost` (the latter detected via GenServer timeout when no input arrives within `lost_after`), invokes the configured `on_degraded`/`on_lost`/`on_recovered` commands. Inherits the transition mechanics defined in Proposal 0018 verbatim; the perception-specific reasons are `:latency_overrun`, `:stale_input`, `:sync_miss`, and `:store_overrun`.
+This requires small, generic additions to `bb` core:
+
+1. **Robot-level estimators.** Core accepts estimator entities that are not nested under a sensor or link and supervises them under `BB.TopologySupervisor`, using its existing restart budget and force-disarm-on-exhaustion behaviour. Their target frame is `nil`; emitted messages retain the model-supplied `frame_id`. Estimator names participate in robot-wide process-name uniqueness validation.
+2. **Pluggable output publication.** An estimator output carries a `publish_with: {module, function}` pair, defaulting to `{BB.PubSub, :publish}`. Store-backed perceptor outputs lower to `{BB.Perception, :publish}`. The estimator calls either function with `(robot, path, message)` and accepts only `:ok`; `{:error, reason}` stops the estimator with that reason, while raises retain normal process-failure semantics. Output telemetry is emitted only after `:ok`.
+3. **Generic intake freshness.** A `max_input_age` estimator option drops stale local inputs before callback dispatch and feeds the existing `:stale_input` health transition. It is independent of `latency_budget`, which continues to measure callback execution time.
+4. **Recovery accounting.** Every successful dispatch advances estimator recovery hysteresis, even when `latency_budget` is omitted. Freshness, synchronisation, or lost transitions must not become permanent merely because callback timing is unconfigured.
+5. **Effective outputs.** Estimator verification and cycle detection use explicit output path overrides, allowing `[:perception, ...]` chains to resolve correctly. Explicit multi-output declarations do not also synthesise an undeclared `:out` output.
+6. **Bulk-data metadata.** The optional `BB.Message.frame_data_fields/0` callback described above lets packages account for bulk fields without core depending on `bb_perception`.
+7. **Extension-owned children.** Robot DSL extensions can contribute ordered children to `BB.TopologySupervisor`. `bb_perception` contributes one store supervisor per robot, starts all declared stores before sensor/controller/link producers, and stops them with the robot. Store-supervisor exhaustion follows topology failure semantics.
+8. **Driver liveness.** For multi-input estimators, only driver arrivals or successful dispatches reset `lost_after`; a live auxiliary stream cannot hide a lost driver.
+9. **Consistent timing units.** Estimator callback and input-to-output latency measurements convert both operands to nanoseconds before subtraction and document measurements in nanoseconds.
+
+Multi-input perceptors use `BB.Estimator.Server`'s existing latest-envelope fan-in and `sync_tolerance`. Algorithms needing historical or nearest-neighbour lookup call `BB.Perception.SampleStore` explicitly; v1 does not add a second automatic fan-in implementation.
 
 #### v1 limitations
 
 - **NIF segfault recovery.** If a NIF segfaults, the BEAM dies. Mitigation (running perception on a separate BEAM node) is deferred.
 - **Hot weight reload.** Restart-to-reload only. Models can implement weight-swapping via `handle_call/3` if they want it.
 - **Cancellation of in-flight inference.** Not attempted. Models that spawn Tasks own the cancellation policy; the canonical pattern is "let it finish, discard if stale" (see `AsyncYolo` example above).
+- **Async latency accounting.** Core `latency_budget` and latency telemetry cover synchronous `handle_input/2` execution. Work completed later through `handle_info/2`, such as `AsyncYolo`, must emit adapter-specific end-to-end telemetry if required; v1 does not infer asynchronous task boundaries.
 
 ### Perceptors DSL section
 
-A new top-level section added by `bb_perception`. Declares perceptor processes — their child specs, inputs, outputs, and policy.
+A new top-level section added by `bb_perception`. It provides perception terminology, conventional output paths, and inline sample-store declarations while lowering execution to robot-level estimators.
 
 ```elixir
 perceptors do
@@ -561,7 +619,7 @@ perceptors do
   end
 
   perceptor :stereo_depth, {BB.Perception.Vision.StereoDepth, weights: "stereo.onnx"} do
-    input :left,  [:sensor, :head, :camera_left], driver: true
+    input :left,  [:sensor, :head, :camera_left], driver?: true
     input :right, [:sensor, :head, :camera_right]
     latency_budget ~u(100 millisecond)
     sync_tolerance ~u(50 millisecond)
@@ -577,7 +635,7 @@ perceptors do
 end
 ```
 
-The `perceptors` section has no section-level options. Per-perceptor transition commands (`on_degraded`, `on_lost`, `on_recovered`) replace what was previously a single section-level `degraded_state` atom. See Proposal 0018 for the transition mechanics; the relevant options carry through to perceptors unchanged.
+The `perceptors` section has no section-level options. Inputs, timing, health transitions, parameter handling, callback dispatch, and telemetry retain their `BB.Estimator` semantics.
 
 #### Perceptor entity
 
@@ -589,16 +647,16 @@ perceptor :name, ChildSpec do
 end
 ```
 
-Where `ChildSpec` is either `Module` or `{Module, opts}`. The module must implement `BB.Estimator`. Options are validated against the module's `options_schema/0` at compile time (literal values) and again at runtime when parameter references resolve.
+Where `ChildSpec` is either `Module` or `{Module, opts}`. The module must implement `BB.Estimator`. Options are validated against the module's `options_schema/0` at compile time for literal values and again at runtime when parameter references resolve. The perceptor transformer produces core estimator configuration; it does not produce a different process type.
 
 #### Inputs
 
 - **Single-input form** — `input path` (no key). Model receives a `BB.Message.t()`.
 - **Multi-input form** — `input key, path` (keyed). Model receives `%{key => BB.Message.t()}`.
-- **Driver** — `driver: true` on exactly one input in a multi-input perceptor. The driver's arrivals trigger inference; non-driver inputs are pulled via `BB.Perception.SampleStore.nearest/3` keyed off the driver's `monotonic_time`.
-- **Sync tolerance** — `sync_tolerance` (per-perceptor) gates how far apart in time the driver and non-driver inputs can be. Defaults to the `latency_budget`. Outside the window: skip the inference and emit a degradation event.
+- **Driver** — `driver?: true` on exactly one input in a multi-input perceptor. The driver's arrivals trigger inference; the estimator server snapshots its most recently received non-driver envelopes.
+- **Sync tolerance** — `sync_tolerance` gates how far apart the driver and non-driver envelopes may be. Outside the window the server skips callback dispatch, emits estimator dropped telemetry, and applies the existing `:sync_miss` health transition.
 
-Multi-input perceptors require their non-driver source streams to be store-backed; the verifier checks this.
+Inputs do not need sample stores for automatic fan-in. A model that requires nearest-neighbour or historical samples declares the relevant streams as store-backed and queries the store explicitly.
 
 #### Outputs
 
@@ -614,21 +672,21 @@ end
 For multi-output perceptors, declare each output explicitly. Each `output :name` block can carry an optional `store:` keyword:
 
 ```elixir
-output :detections, store: [retention: ~u(2 second), on_overrun: :degrade]
+output :detections, store: [retention: ~u(2 second), on_overrun: :warn]
 output :keypoints,  store: [retention: ~u(2 second)]
 ```
 
-The model's reply tuples must use names matching declared outputs. Unknown names raise at runtime.
+The model's reply tuples must use names matching declared outputs. Unknown names raise at runtime. The transformer sets each output's effective path and `publish_with` pair: store-backed outputs use `{BB.Perception, :publish}`; all others retain `{BB.PubSub, :publish}`.
 
 `frame_id` on emitted messages comes from whatever the model sets. The framework doesn't second-guess it.
 
 #### Latency policy
 
-- `latency_budget` — end-to-end (driver input `monotonic_time` → output published). Required when freshness gating is enabled. Used both for intake drop threshold and for overrun detection feeding the perceptor's transition state machine.
-- `freshness` — `:on | :off`. Default `:on`. When `:off`, the framework dispatches every input regardless of staleness.
-- `lost_after` — duration unit (or parameter reference). Forwarded to the underlying `BB.Estimator.Server` for GenServer-timeout-based `:lost` detection. Default `5 × latency_budget`.
-- `recover_after` — number of consecutive in-budget completions to transition `:degraded → :healthy`. Default 10. Accepts a parameter reference.
-- `on_degraded` / `on_lost` / `on_recovered` — command names fired on transitions, per Proposal 0018.
+- `max_input_age` — maximum local age of the driver envelope at intake. When omitted there is no age gate. Cross-node monotonic timestamps are not comparable and are rejected when this option is set.
+- `latency_budget` — maximum synchronous `handle_input/2` execution time before the estimator transitions to `:degraded` with `:latency_overrun`.
+- `lost_after` — no-input duration before the estimator transitions to `:lost`.
+- `recover_after` — consecutive in-budget completions required to transition from `:degraded` to `:healthy`; inherited default is 1.
+- `on_degraded` / `on_lost` / `on_recovered` — command names fired by the existing estimator transition machinery.
 
 #### Chaining
 
@@ -656,51 +714,47 @@ The verifier walks the dependency graph and rejects cycles.
 
 - Each `input` path resolves to an existing sensor or perceptor output. Path lookups are pre-cached via `Spark.Dsl.Transformer.persist/3`.
 - Single vs. multi-input form is consistent across all `input` blocks on a perceptor.
-- `driver: true` set on at most one input; required for multi-input perceptors.
-- Non-driver input source streams in multi-input perceptors are store-backed.
+- `driver?: true` set on exactly one input for multi-input perceptors.
 - Perceptor module exists and implements `BB.Estimator`.
 - Output topic doesn't collide with any sensor path.
-- `latency_budget` is a positive duration unit when `freshness: :on`.
+- `max_input_age`, `latency_budget`, `lost_after`, and `sync_tolerance` are positive duration units when present.
 - Configured `on_degraded`/`on_lost`/`on_recovered` command names resolve to commands declared in the robot's `commands` section.
-- No cycles in the perceptor dependency graph.
+- Effective output paths are included in the estimator catalogue and no cycles exist in the combined estimator/perceptor dependency graph.
 
 ### Health transitions
 
-Perception inherits the transition state machine from `BB.Estimator` (Proposal 0018) without modification. Three states (`:healthy`, `:degraded`, `:lost`), hysteresis-debounced transitions, GenServer-timeout-based `:lost` detection, and per-perceptor `on_degraded`/`on_lost`/`on_recovered` command options. There is no separate health payload type, no `BB.Perception.Health` channel, and no health monitor process.
+Perception uses the core `BB.Estimator` transition state machine: `:healthy`, `:degraded`, and `:lost`, hysteresis-debounced recovery, timeout-based lost detection, and per-estimator transition commands. The recovery-accounting correction listed under runtime reuse is a generic core fix, not a perception-specific state machine. There is no separate health payload, channel, monitor, or perceptor health state.
 
-Perception-specific transition reasons surfaced to invoked commands:
+The relevant estimator transition reasons are:
 
-- `:latency_overrun` — driver input to output exceeded `latency_budget`.
-- `:stale_input` — incoming input older than `latency_budget × N` (intake freshness gate).
-- `:sync_miss` — multi-input synchronisation gap exceeded `sync_tolerance`.
-- `:store_overrun` — a store-backed output's retention triggered eviction with `on_overrun: :degrade`.
+- `:latency_overrun` — callback execution exceeded `latency_budget`.
+- `:stale_input` — the incoming local envelope exceeded `max_input_age`.
+- `:sync_miss` — multi-input synchronisation exceeded `sync_tolerance` or an input was missing.
+- `:lost` and `:recovered` — existing estimator timeout and recovery transitions.
+
+Sample-store retention does not change estimator health. Store pressure is observable through store telemetry and logging.
 
 The `allowed_states` mechanism on commands handles state-machine gating for free: a perceptor's `on_degraded` command can transition the robot to a degraded operational state, and other commands' `allowed_states` decide whether to permit operation while degraded. This is the same pattern as Proposal 0018 — perception just inherits it.
 
 #### Process death
 
-When supervisors give up restarting a perceptor (exceeded `max_restarts`), the perceptor's subtree dies and propagates up via the existing OTP supervision tree. There is no `:failed` health state to publish, by design — process death is an OTP concern, not a state-machine value. Downstream consumers that need to react to perceptor death can monitor the process or subscribe to BB's existing supervision-event channel.
+When supervisors give up restarting a perceptor, failure propagates through the existing robot supervision tree. There is no `:failed` health state: process death is an OTP concern, not a state-machine value. Consumers that need direct notification may monitor the registered estimator process.
+
+### Relationship to bb_policy
+
+Perception and policy share an integration boundary, not a runtime. A perceptor consumes messages and publishes derived messages continuously, including while the robot is disarmed. A policy consumes a validated observation snapshot and produces effects that are applied only while armed.
+
+The companion `bb_policy` design plans to collect perception exactly as it collects any other message input: a policy declares named source paths through an optional `inputs/1` callback, the policy runtime caches the latest complete `BB.Message` envelope for each path, and `BB.Policy.observe/3` converts those envelopes into model-specific tensors. Payloads are not stripped at the package boundary because timestamps, source node, and frame identity are required for freshness and alignment checks. Joint-only policies declare no message inputs and retain the existing empty-map behaviour. This remains separate work under [bb_policy issue #9](https://github.com/beam-bots/bb_policy/issues/9), not an API shipped by this proposal.
+
+That design makes missing, stale, cross-node, or misaligned required inputs prevent inference and new effect publication. Because previous velocity and effort commands may remain active when a process merely stops producing effects, invalidation after the policy has applied an effect requests a planned direct safety-originated disarm before a bounded policy terminates; a standing policy controller requests the same intervention. Perception health transitions remain independent and may invoke additional robot-specific commands.
+
+Reusable decode, rotate, undistort, detection, and embedding stages remain perceptors. Processing tied to a particular policy's trained input contract — tensor layout, resizing, feature selection, and normalisation — remains in that policy. `bb_perception` does not invoke policies and `bb_policy` does not own perception supervision or sample retention.
 
 ### Telemetry
 
-No spans. The OTP-flavoured perceptor callbacks don't have a natural start/stop pair — accumulators consume many inputs before emitting, async inference returns out-of-band. Instead, counters and a latency event:
+Perceptors emit core estimator events (`[:bb, :estimator, :input]`, `:output`, `:latency`, `:dropped`, and `:transition`) where the estimator server has the corresponding synchronous driver context. `bb_perception` does not duplicate them under a second namespace; asynchronous adapters own any additional end-to-end timing event.
 
-- `[:bb, :perception, :input]` — counter per input delivered to a perceptor.
-  - Measurements: `%{count: 1}`
-  - Metadata: `%{robot: atom, perceptor: atom, source_path: [atom]}`
-
-- `[:bb, :perception, :output]` — counter per message emitted.
-  - Measurements: `%{count: 1}`
-  - Metadata: `%{robot: atom, perceptor: atom, output: atom, payload_module: module}`
-
-- `[:bb, :perception, :latency]` — duration from input `monotonic_time` to emission.
-  - Measurements: `%{duration: native_time}`
-  - Metadata: `%{robot: atom, perceptor: atom, output: atom}`
-  - Latency is computed by reading `monotonic_time` off the emitted message — the model is expected to carry through the driver input's `monotonic_time` when output latency is meaningful. For accumulators, models typically use the newest input's `monotonic_time`.
-
-- `[:bb, :perception, :dropped]` — counter per intake freshness drop.
-  - Measurements: `%{count: 1}`
-  - Metadata: `%{robot: atom, perceptor: atom, source_path: [atom], reason: :stale_input | :sync_miss}`
+The package owns one additional event for its storage concern:
 
 - `[:bb, :perception, :store_overrun]` — counter per sample-store overrun event.
   - Measurements: `%{count: 1, dropped: integer}`
@@ -715,33 +769,14 @@ defmodule BB.Perception.Error do
     defimpl BB.Error.Severity, do: (def severity(_), do: :warning)
   end
 
-  defmodule StaleInput do
-    use BB.Error, class: :state, fields: [:path, :age_ms, :budget_ms]
-    defimpl BB.Error.Severity, do: (def severity(_), do: :warning)
-  end
-
-  defmodule SyncMiss do
-    use BB.Error, class: :state,
-      fields: [:driver_path, :input_path, :gap_ms, :tolerance_ms]
-    defimpl BB.Error.Severity, do: (def severity(_), do: :warning)
-  end
-
-  defmodule ModelLoadFailed do
-    use BB.Error, class: :hardware, fields: [:perceptor, :reason]
-    defimpl BB.Error.Severity, do: (def severity(_), do: :error)
-  end
-
   defmodule NoStore do
     use BB.Error, class: :invalid, fields: [:path]
     defimpl BB.Error.Severity, do: (def severity(_), do: :error)
   end
-
-  defmodule UnknownOutput do
-    use BB.Error, class: :invalid, fields: [:perceptor, :name, :declared]
-    defimpl BB.Error.Severity, do: (def severity(_), do: :error)
-  end
 end
 ```
+
+Stale-input, synchronisation, and unknown-output failures remain core estimator errors. Model-loading errors belong to the adapter that loads the model.
 
 ---
 
@@ -753,7 +788,6 @@ bb_perception/
 │   ├── bb/
 │   │   ├── perception.ex                       # top-level: publish/3 helper
 │   │   ├── perception/
-│   │   │   ├── application.ex
 │   │   │   ├── dsl.ex                          # Spark DSL extension
 │   │   │   ├── dsl/
 │   │   │   │   ├── perceptors.ex               # section
@@ -764,9 +798,8 @@ bb_perception/
 │   │   │   │   ├── stream.ex                   # entity
 │   │   │   │   ├── retention.ex
 │   │   │   │   ├── transformers/
+│   │   │   │   │   └── lower_perceptors.ex     # perceptor → estimator
 │   │   │   │   └── verifiers/
-│   │   │   ├── perceptor/server.ex             # framework wrapper (specialises BB.Estimator.Server)
-│   │   │   ├── perceptor/supervisor.ex
 │   │   │   ├── sample_store.ex                 # public API
 │   │   │   ├── sample_store/
 │   │   │   │   ├── server.ex                   # per-stream owner
@@ -796,7 +829,8 @@ bb_perception/
 ```elixir
 defp deps do
   [
-    {:bb, bb_dep("~> 0.13")},     # provides BB.Estimator behaviour + estimator DSL
+    {:bb, bb_dep("~> 0.23")},
+    {:nx, "~> 0.12"},
     {:spark, "~> 2.0"},
     {:localize, "~> 0.37"},
     {:telemetry, "~> 1.0"}
@@ -804,7 +838,7 @@ defp deps do
 end
 ```
 
-Depends on `bb` for `BB.Estimator` (the perceptor behaviour), the `estimator` DSL entity that the `perceptor` entity specialises, and the transition-state-machine mechanics. `nx` is inherited transitively via `bb` (which uses it for kinematics and transforms); `bb_perception` adds no further ML inference dependencies. No `ortex`, no `bumblebee`, no `exla`, no `evision`, no vendor NIFs — driver and adapter packages bring those.
+Depends on `bb` for `BB.Estimator`, robot-level estimator wiring, pluggable output publication, intake freshness, and transition-state-machine mechanics. `~> 0.23` is the intended first core release containing those additions and must be adjusted if they ship under a different version. `nx` is a direct dependency because numeric payload schemas and the `FrameData` implementation use `Nx.Tensor`; core already carries the same runtime cost. `bb_perception` adds no inference backend. No `ortex`, `bumblebee`, `exla`, `evision`, or vendor NIFs — driver and adapter packages bring those.
 
 ### Companion package landscape
 
@@ -855,6 +889,8 @@ A consumer reads the latest frame:
 {:ok, %BB.Message{payload: %BB.Perception.Message.Image{} = img}} =
   BB.Perception.SampleStore.latest(MyRobot, [:sensor, :base_link, :camera])
 ```
+
+The camera driver must publish frames on this store-backed path with `BB.Perception.publish/3`; direct `BB.PubSub.publish/3` would bypass the declared store and is unsupported.
 
 ### Object detection pipeline
 
@@ -939,7 +975,7 @@ end
 perceptors do
   perceptor :stereo_depth,
     {BB.Perception.Vision.StereoDepth, weights: "priv/stereo.onnx"} do
-    input :left,  [:sensor, :head, :camera_left], driver: true
+    input :left,  [:sensor, :head, :camera_left], driver?: true
     input :right, [:sensor, :head, :camera_right]
     latency_budget ~u(100 millisecond)
     sync_tolerance ~u(20 millisecond)
@@ -998,45 +1034,64 @@ When `:obstacle_detection` degrades, the perceptor invokes `:enter_degraded`, wh
 
 - [ ] `Image` and `LaserScan` removed from `bb`; equivalent payloads land in `bb_perception` with namespaced module names.
 - [ ] Additional payload types: `PointCloud`, `Depth`, `Stereo`, `IR`, `Detections`, `Masks`, `Keypoints`, `DepthMap`, `Embedding`, `Classification`.
+- [ ] Every payload schema specifies required/optional fields, tensor element types and ranks, cross-field shape invariants, units/encodings, and validation tests; no numeric list or binary convention is implicit.
 - [ ] `BB.Perception.Dsl` extension loads cleanly via `use BB, extensions: [BB.Perception.Dsl]`.
 - [ ] `streams` DSL section with `stream` entity, `retention` (union-typed, multi-occurrence, max one per kind), `on_overrun`.
 - [ ] Compile-time verifier for `streams` (paths resolve via persisted topology cache, retentions present and well-typed, no duplicate kinds, `on_overrun` valid).
 - [ ] `BB.Perception.SampleStore.Server` per declared stream, supervised, with ETS-backed storage, `insert_new` collision avoidance, and pluggable retention.
+- [ ] ETS objects use `{monotonic_time, %BB.Message{}}`; public reads return the canonical envelope rather than the storage tuple.
+- [ ] Retention tests cover count, stream-time duration, and byte caps independently and in combination (`any` cap triggers oldest-unpinned eviction).
+- [ ] Duration retention does not age a stopped stream by wall time, and pinned samples remain exempt from ordinary eviction.
+- [ ] Robot-scoped store supervisors start before topology producers through a generic extension-child hook and stop with their robot.
 - [ ] Read API: `latest`, `fetch`, `nearest`, `before`, `after`, `range`, `since`, `pin`, `unpin`, `pinned`, `stats`.
-- [ ] `BB.Perception.publish/3` writes to store + dispatches via pubsub; returns `{:error, :no_store}` for paths without a declared store.
-- [ ] Refc binary handling verified — no per-subscriber copies for large payloads (test via `:erlang.process_info(pid, :binary)`).
-- [ ] `BB.Perception.FrameData` protocol with `to_iodata/1`, `byte_size/1`, `residency/1`; `BitString` impl.
-- [ ] `frame_data_field/0` optional callback added to `BB.Message` in `bb`; perception payloads carrying bulk data implement it.
+- [ ] `BB.Perception.publish/3` stores synchronously before PubSub and returns a structured `NoStore` error for undeclared paths.
+- [ ] Stored and delivered envelopes are structurally identical, including collision-adjusted `monotonic_time` and `robot`.
+- [ ] Store insertion or retention failure publishes nothing.
+- [ ] Pin pressure that prevents retention compliance rolls back the new sample and returns `StoreOverrun`.
+- [ ] PubSub failure leaves the canonical envelope stored, surfaces the failure, and is documented as non-idempotent on retry.
+- [ ] Local refc binary handling verified — no per-subscriber copies for large payloads (test via `:erlang.process_info(pid, :binary)`).
+- [ ] `BB.Perception.FrameData` protocol with `to_iodata/1`, `byte_size/1`, `residency/1`; byte-aligned `BitString` and typed `Nx.Tensor` implementations.
+- [ ] `frame_data_fields/0` optional callback added to `BB.Message` in `bb`; perception payloads list every bulk field.
 - [ ] SampleStore byte-cap retention reads payload sizes via `BB.Perception.FrameData.byte_size/1`.
 
-### Phase 2: Perceptor wrapper and DSL
+### Phase 2: Estimator integration and DSL
 
-- [ ] `BB.Perception.Perceptor.Server` specialises `BB.Estimator.Server` (from Proposal 0018) with intake freshness, multi-input fan-in via sample store, store-backed output routing.
-- [ ] `perceptors` DSL section with `perceptor` entity. `perceptor` is a specialised `estimator` entity adding perception-specific options: `freshness`, `sync_tolerance`, `output ... store: [...]`, inline `store` shorthand.
-- [ ] `perceptor` inherits `input`/`output`/`latency_budget`/`lost_after`/`recover_after`/`on_degraded`/`on_lost`/`on_recovered` from `estimator`.
-- [ ] Compile-time verifier for `perceptors` (paths resolve, single-vs-multi consistent, driver constraint, non-driver inputs store-backed, no cycles, command names resolve).
+- [ ] Core supports robot-level estimators using `BB.Estimator.Server`.
+- [ ] Robot-level estimators run under `BB.TopologySupervisor` and participate in robot-wide process-name uniqueness validation.
+- [ ] Core estimator outputs support a generic `publish_with: {module, function}` pair, defaulting to `{BB.PubSub, :publish}`.
+- [ ] Estimator publishers treat only `:ok` as success, stop on `{:error, reason}`, preserve raise semantics, and emit output telemetry only after success.
+- [ ] Core estimators support `max_input_age` independently of callback `latency_budget`.
+- [ ] Successful dispatch advances recovery even when no `latency_budget` is configured.
+- [ ] Multi-input lost detection is driven by the driver input or successful dispatch, not auxiliary input traffic.
+- [ ] Estimator latency telemetry uses documented nanosecond units consistently.
+- [ ] Core estimator verification resolves effective output path overrides for input lookup and cycle detection.
+- [ ] Explicit multi-output estimators do not retain an undeclared implicit `:out` route.
+- [ ] `perceptors` DSL section lowers every `perceptor` to robot-level estimator configuration; no `BB.Perception.Perceptor.Server` exists.
+- [ ] `perceptor` retains core estimator input, output, timing, health, parameter, and callback semantics while adding perception paths and inline store declarations.
+- [ ] Compile-time verifier for perceptors covers path resolution, input form, driver constraint, output collisions, store declarations, command references, and combined estimator/perceptor cycles.
 - [ ] Single-output perceptors publish to `[:perception, perceptor_name]` from reply tuples tagged `:out`.
 - [ ] Multi-output perceptors publish to `[:perception, perceptor_name, name]` per declared output.
-- [ ] Latency budget enforced on intake (drop stale inputs with telemetry).
+- [ ] Store-backed outputs use `BB.Perception.publish/3`; non-store-backed outputs use `BB.PubSub.publish/3`.
+- [ ] Missing, stale, and misaligned inputs use core estimator drop telemetry and health transitions.
 - [ ] At least one reference perceptor adapter exists demonstrating the contract.
 
 ### Phase 3: Transition commands
 
 - [ ] Transition mechanics inherited from `BB.Estimator` (Proposal 0018).
-- [ ] Perception-specific transition reasons surface in command metadata: `:latency_overrun`, `:stale_input`, `:sync_miss`, `:store_overrun`.
-- [ ] Store overruns with `on_overrun: :degrade` count toward the owning perceptor's degradation hysteresis.
-- [ ] Telemetry events: `:input`, `:output`, `:latency`, `:dropped`, `:store_overrun`.
+- [ ] Estimator transition reasons surface in command metadata: `:latency_overrun`, `:stale_input`, `:sync_miss`, `:lost`, and `:recovered`.
+- [ ] Perceptors emit applicable core estimator input, output, synchronous latency, dropped, and transition telemetry without duplicate perception events.
+- [ ] Sample stores independently emit `[:bb, :perception, :store_overrun]` telemetry.
 
 ### Phase 4: Chaining & polish
 
-- [ ] Perceptor chaining (perceptor consumes another perceptor's output).
-- [ ] Cycle detection in the perceptor graph.
+- [ ] Perceptor chaining resolves effective `[:perception, ...]` output paths.
+- [ ] Cycle detection covers the combined estimator/perceptor graph.
 - [ ] Documentation: README, tutorial covering camera → decode → detect, tutorial covering LIDAR + SLAM-style pinning, tutorial covering accumulator and async-inference patterns.
 - [ ] `mix.usage_rules` documentation.
 
 ### Won't have (deferred)
 
-- [ ] Concrete device-resident `FrameData` implementations (HAILO/CUDA zero-copy). The `BB.Perception.FrameData` protocol ships in v1 so sibling packages (`bb_perception_hailo`, etc.) can add device-resident impls without further changes to `bb_perception`; this proposal does not include any such impl beyond `BitString`.
+- [ ] Concrete device-resident `FrameData` implementations (HAILO/CUDA zero-copy). V1 includes host binaries and `Nx.Tensor`; sibling packages may add owning, BEAM-lifetime-managed device carriers conforming to the protocol.
 - [ ] Cross-node sample store lookups (consumers `:erpc` explicitly if needed).
 - [ ] Hot reload of model weights without restart (perceptors can implement via `handle_call/3` if they want it).
 - [ ] Recorded replay support (separate `bb_replay` proposal).
@@ -1045,29 +1100,19 @@ When `:obstacle_detection` degrades, the perceptor invokes `:enter_degraded`, wh
 
 ## Open questions
 
-1. **Single-output reply shorthand.** The proposal uses `:out` as the implicit name in `{:reply, [{:out, msg}], state}`. Worth supporting `{:reply, %BB.Message{}, state}` as a shorthand that wraps to `[{:out, msg}]` — more ergonomic for the common case, no loss of consistency since the framework normalises on the way through.
+1. **Pin ownership.** Explicit `unpin/3` is simple but cannot recover automatically when a caller dies. Should pins be leases associated with owner processes, or should v1 retain manual ownership with telemetry for leaked capacity?
 
-2. **Store retention duration clock.** Decided: newest sample's `monotonic_time`, not `System.monotonic_time/0`. Worth documenting prominently because it's surprising for anyone expecting wall-clock semantics.
-
-3. **Multi-output perceptors mixing store-backed and non-store-backed outputs.** Currently allowed (each `output` block independently declares `store`). Worth confirming no subtle issues with the supervision tree shape.
-
-4. **Conditionally-compiled topology.** What's the right behaviour when a perceptor's `input` source sensor has not yet been added to the topology because of conditional compilation? Probably compile-time error — better to fail loudly than ship a degraded robot.
-
-5. **Opting out of automatic supervision.** Should the DSL support marking a perceptor as "only run during specific commands"? Plausible v2 feature; for v1 perceptors always run.
-
-6. **Bypassing the store on `BB.Perception.publish/3`.** Some callers might want to publish a message to a store-backed path without storing it (e.g. test injection). Currently the answer is "use `BB.publish/3` directly" but the path is store-backed by definition. Probably leave as-is and revisit if a concrete need emerges.
-
-7. **Cross-perceptor coordination of degraded-state transitions.** With per-perceptor `on_degraded` commands, two perceptors degrading simultaneously could fire two transition commands, each trying to transition the robot to its own degraded state. The existing `allowed_states` mechanism prevents inconsistent transitions, but the resulting behaviour (whichever command fires first wins) may surprise developers. Worth documenting; possibly worth a `coordinated:` option on transition commands in a future revision.
+2. **Cross-perceptor transition coordination.** Two perceptors can invoke conflicting transition commands concurrently. Existing command `allowed_states` prevents invalid transitions, but the first accepted command wins; coordinated health policy remains a possible follow-up.
 
 ---
 
 ## References
 
-- [Proposal 0018: BB.Estimator](0018-bb-estimator.md) — defines the behaviour that perceptor modules implement and the transition-state-machine mechanics perception inherits.
-- [BB.Sensor behaviour](../../bb/lib/bb/sensor.ex) — pattern for behaviour-based driver modules.
-- [BB.Message](../../bb/lib/bb/message.ex) — envelope carries `monotonic_time`, `wall_time`, `node`, `frame_id`, `robot`.
-- [BB.PubSub](../../bb/lib/bb/pub_sub.ex) — hierarchical pubsub the perception channel is built on.
-- [BB.Safety](../../bb/lib/bb/safety.ex) — the contract perception deliberately does not extend.
+- [Proposal 0018: BB.Estimator](https://github.com/beam-bots/proposals/blob/main/implemented/0018-bb-estimator.md) — defines the implemented behaviour, runtime, and transition-state-machine mechanics perception uses. Its older references to a perception-specific server are superseded by this revision.
+- [BB.Sensor behaviour](https://github.com/beam-bots/bb/blob/main/lib/bb/sensor.ex) — pattern for behaviour-based driver modules.
+- [BB.Message](https://github.com/beam-bots/bb/blob/main/lib/bb/message.ex) — envelope carries `monotonic_time`, `wall_time`, `node`, `frame_id`, `robot`.
+- [BB.PubSub](https://github.com/beam-bots/bb/blob/main/lib/bb/pub_sub.ex) — local hierarchical pubsub the perception channel is built on.
+- [BB.Safety](https://github.com/beam-bots/bb/blob/main/lib/bb/safety.ex) — the contract perception deliberately does not extend.
 - [Proposal 0003: bb_dataset](0003-bb-dataset.md) — adjacent concern; recording sample streams ties into perception.
 - [yolo_elixir](https://github.com/poeticoding/yolo_elixir) — reference behaviour-based wrapper; informed the original behaviour shape.
 - [Bumblebee + Nx.Serving](https://github.com/elixir-nx/bumblebee) — the batching/distribution model the adapter for it will wrap.
