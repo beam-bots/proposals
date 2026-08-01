@@ -6,9 +6,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal 0021: Actuator Command Pipeline
 
-**Status:** Draft
+**Status:** In Progress
 **Author:** James Harton
 **Created:** 2026-07-31
+
+Phases 1 and 3 shipped in [bb 0.23.0](https://github.com/beam-bots/bb/pull/204), along with
+the driver migrations in Phase 4. Phase 2 — ownership, and the `command_payloads/1`
+extension point it brought to light — is outstanding.
 
 ---
 
@@ -142,6 +146,29 @@ BB.PubSub.subscribe(bb.robot, [:actuator | bb.path], message_types: @command_pay
 The type filter is load-bearing, not tidiness. `[:actuator | path]` is bidirectional: `publish_begin_motion/3` (`actuator.ex:332`) publishes `BeginMotion` to the same topic, so an unfiltered subscription would deliver every actuator its own outbound traffic. `BB.PubSub.subscribe/3` already supports the filter (`pub_sub.ex:83`), and filtering by payload separates inbound commands from outbound events without touching the topic taxonomy.
 
 The catch-all at `server.ex:190` is narrowed to the actuator's own command topic. Today it matches `{:bb, _any_topic, %Message{}}` and applies *this actuator's* transmission to it, so a driver that subscribes to another actuator's command topic — a follower tracking a leader arm — has the command silently rescaled by the wrong transmission. After this change, anything arriving on a topic the driver subscribed to itself is delegated to its `handle_info/2` untouched.
+
+### Declaring the command vocabulary — `command_payloads/1`
+
+A fixed list of six is the right default and the wrong hard limit. `lostbean/bb_mcuhub` — a third-party package in bb's external CI matrix — resolves each port's accepted command struct at runtime from its own port index, via a `command_message/0` seam on its value-types. Every value-type it ships today names a BB built-in, so the fixed list happens to cover it; a value-type naming a struct of its own would not be covered.
+
+The failure mode is what makes this worth fixing rather than documenting. A payload outside the list isn't rejected — it simply isn't delivered, so the driver's recourse is to subscribe to its own command topic. That message then fails the narrowed `handle_info` guard, is delegated straight to the driver, and arrives having skipped the arm gate and (per Phase 2) the ownership check. The extension point exists so that drivers with their own command vocabulary route *through* the pipeline rather than around it, keeping the safety properties this proposal establishes.
+
+```elixir
+@callback command_payloads(opts :: keyword()) :: [module()]
+```
+
+Optional, defaulted by `use BB.Actuator` to the six built-ins. It takes the resolved options rather than being zero-arity because the set isn't always known at compile time — `bb_mcuhub` derives it from a hub and port named in its opts.
+
+The server calls it after option resolution and uses the result in **both** places: the `message_types` subscription filter and the dispatch guard. Both are required. `message_types` only governs pubsub, so a callback feeding only the subscription would leave a driver that narrows its vocabulary still receiving everything through `set_position!/4`.
+
+One callback therefore serves both directions:
+
+- **Widening** — a driver with a bespoke command struct gets it through the gate instead of around it.
+- **Narrowing** — a port that speaks only `Effort` declares `[Command.Effort]`, and the framework enforces it. This subsumes a filter such packages otherwise hand-roll inside `handle_command/2`.
+
+Two alternatives were considered and rejected. A marker behaviour on payload modules (`BB.Message.Command`) is more open — any module declaring itself a command is one — but `BB.PubSub`'s `message_types` is a concrete list matched in `dispatch_to_subscribers/4`, so a predicate means subscribing unfiltered and reintroducing the `BeginMotion` echo the filter exists to prevent. Supporting it properly means extending PubSub with kind-based filtering: a large change to the message system for something one callback solves. A `kind` field on payloads has the same PubSub problem and touches every payload module besides.
+
+This lands with Phase 2 rather than Phase 1. It is the same surface as arbitration — `command_payloads/1` decides what enters the pipeline, ownership decides what survives it — so landing them together means one behaviour change for driver authors instead of two, and lets the lease design assume an open payload set rather than a fixed one.
 
 ### Arm gating
 
@@ -330,19 +357,19 @@ BB.Actuator.owner(MyRobot, :shoulder_servo)
 
 ### Must Have
 
-#### Phase 1 — inbound pipeline
+#### Phase 1 — inbound pipeline (shipped in bb 0.23.0)
 
-- [ ] `BB.Actuator.handle_command/2` defined, required, documented
-- [ ] `BB.Actuator.Server` subscribes to `[:actuator | bb.path]` filtered to the six `Command.*` payloads
-- [ ] All three transports route through one gated pipeline and converge on `handle_command/2`
-- [ ] Reply routed per transport; `{:noreply, state}` yields `{:ok, :accepted}` for the sync transport
-- [ ] `server.ex:190` narrowed so a driver's own subscriptions reach `handle_info/2` untransformed
-- [ ] Arm gate enforced centrally; `Command.Stop` exempt, `Command.Hold` not
-- [ ] `BB.Error.State.NotArmed` with a `BB.Error.Severity` impl
-- [ ] `BB.Sim.Actuator` migrated; `test/support/recording_actuator.ex` no longer self-subscribes
-- [ ] Test proving a pubsub command reaches a driver *without* the driver subscribing
+- [x] `BB.Actuator.handle_command/2` defined, required, documented
+- [x] `BB.Actuator.Server` subscribes to `[:actuator | bb.path]` filtered to the six `Command.*` payloads
+- [x] All three transports route through one gated pipeline and converge on `handle_command/2`
+- [x] Reply routed per transport; `{:noreply, state}` yields `{:ok, :accepted}` for the sync transport
+- [x] `server.ex:190` narrowed so a driver's own subscriptions reach `handle_info/2` untransformed
+- [x] Arm gate enforced centrally; `Command.Stop` exempt, `Command.Hold` not
+- [x] `BB.Error.State.NotArmed` with a `BB.Error.Severity` impl
+- [x] `BB.Sim.Actuator` migrated; `test/support/recording_actuator.ex` no longer self-subscribes
+- [x] Test proving a pubsub command reaches a driver *without* the driver subscribing
 
-#### Phase 2 — ownership
+#### Phase 2 — ownership and the command vocabulary
 
 - [ ] `BB.Actuator.Arbiter` per robot, in the root supervision tree, owning a public-read ETS table
 - [ ] `acquire/3`, `release/2`, `owner/2`; actuator, joint and list targets; joint acquisition all-or-nothing
@@ -351,20 +378,26 @@ BB.Actuator.owner(MyRobot, :shoulder_servo)
 - [ ] Displaced owner receives `{:bb_lease_revoked, …}`
 - [ ] Owner death releases the lease via monitor
 - [ ] Leases survive disarm and re-arm
+- [ ] `command_payloads/1` optional callback, defaulted to the six built-ins
+- [ ] The callback drives both the `message_types` subscription filter and the dispatch guard, so narrowing holds across all three transports
+- [ ] Test proving a bespoke command payload reaches `handle_command/2` *and* is refused while disarmed — i.e. enters the pipeline rather than bypassing it
 
 #### Phase 3 — addressing and docs
 
 - [ ] `BB.Robot.actuator_path/2` public; `BB.Motion`'s private copy removed
 - [ ] Pubsub API accepts an actuator name or a full path
-- [ ] Tutorial 12 rewritten around `handle_command/2`; inbound diagram corrected
-- [ ] `usage-rules/actuators.md` corrected — path example and the driver contract
+- [x] Tutorial 12 rewritten around `handle_command/2`; inbound diagram corrected
+- [x] `usage-rules/actuators.md` corrected — path example and the driver contract
+- [x] `documentation/how-to/integrate-servo-driver.md` corrected — it carried the fullest version of the old contract
 - [ ] Ownership documented, including the unleased default
 
 #### Phase 4 — ecosystem
 
-- [ ] `bb` 0.23.0 released
-- [ ] feetech, robotis, pca9685, pigpio migrated, self-subscriptions and `armed?` checks removed
-- [ ] `bb_pid_controller` and `bb_policy` bumped and verified end to end
+- [x] `bb` 0.23.0 released
+- [x] feetech, robotis, pca9685, pigpio migrated, self-subscriptions and `armed?` checks removed
+- [x] `bb_ik_fabrik`'s test mock actuator migrated
+- [x] `bb_pid_controller` and `bb_policy` verified end to end — neither needed a source change
+- [ ] Third-party packages notified: `lostbean/bb_mcuhub` (PR open), `mcass19/bb_tui` (unaffected)
 
 ### Should Have
 
@@ -386,26 +419,32 @@ BB.Actuator.owner(MyRobot, :shoulder_servo)
 
 ## Open Questions
 
-1. **`handle_command/2` collides in name with `BB.Command.handle_command/3`.** Different behaviour, different arity, and `@impl BB.Actuator` disambiguates in code — but prose becomes ambiguous. The alternative is `handle_actuator_command/2`, which is uglier and less accurate given the payload is literally a `BB.Message.Actuator.Command.*`. Keeping `handle_command/2` unless the ambiguity bites during implementation.
+1. ~~**`handle_command/2` collides in name with `BB.Command.handle_command/3`.**~~ Resolved: kept. The arity and `@impl BB.Actuator` disambiguated cleanly through the whole Phase 1 migration, across six packages, and the ambiguity never bit.
 
-2. **Arbiter crash loses every lease.** The ETS table dies with its owner, so a crashed arbiter fails open to free-for-all. That's today's behaviour and the arm gate is independent, so it's not a safety regression — but an ETS `heir` or a restart-time rebuild from monitors would be more predictable. Worth deciding whether fail-open is acceptable for ownership state.
+2. **Does `command_payloads/1` need re-evaluating at runtime?** It is called once, after option resolution at `init`. A driver whose accepted payloads change while running — a port reconfigured through the parameter system, say — would need its subscription updated, which means re-subscribing with new `message_types`. No current package needs this; `handle_options/2` is the obvious hook if one does. Worth confirming that once-at-init is enough before implementing.
 
-3. **Leases surviving disarm.** Decided yes, on the grounds that safety and ownership are orthogonal and clearing them would strand a commander across a momentary disarm. The counter-argument is that a full disarm is a natural "everybody let go" boundary. Confirm before implementing.
+3. **Arbiter crash loses every lease.** The ETS table dies with its owner, so a crashed arbiter fails open to free-for-all. That's today's behaviour and the arm gate is independent, so it's not a safety regression — but an ETS `heir` or a restart-time rebuild from monitors would be more predictable. Worth deciding whether fail-open is acceptable for ownership state.
 
-4. **Bare integer priorities vs named levels.** Integers are simple and totally ordered; named levels are self-documenting and prevent a priority arms race. Named levels can wrap integers later without breaking callers.
+4. **Leases surviving disarm.** Decided yes, on the grounds that safety and ownership are orthogonal and clearing them would strand a commander across a momentary disarm. The counter-argument is that a full disarm is a natural "everybody let go" boundary. Confirm before implementing.
 
-5. **Discarded replies on the cast and pubsub transports.** A driver returning `{:reply, {:error, reason}, state}` to a cast has that reply silently dropped. Emit telemetry, or accept it as the nature of fire-and-forget?
+5. **Bare integer priorities vs named levels.** Integers are simple and totally ordered; named levels are self-documenting and prevent a priority arms race. Named levels can wrap integers later without breaking callers.
 
-6. **Should `Command.Hold` bypass the arm gate?** Decided no — holding energises hardware. But "hold current position" is arguably closer to fail-safe than to motion, and a driver may implement hold as a passive brake. Confirm.
+6. **Discarded replies on the cast and pubsub transports.** A driver returning `{:reply, {:error, reason}, state}` to a cast has that reply silently dropped. Emit telemetry, or accept it as the nature of fire-and-forget?
 
-7. **Whether `bb_pid_controller` and `bb_policy` should acquire leases automatically or leave it to the user.** Automatic is safer and matches intent; explicit is less surprising and avoids a controller monopolising a joint the user wanted to share.
+7. **Should `Command.Hold` bypass the arm gate?** Decided no — holding energises hardware. But "hold current position" is arguably closer to fail-safe than to motion, and a driver may implement hold as a passive brake. Confirm.
 
-8. **Interaction with `BB.Motion`'s multi-actuator sends.** `send_positions/3` fans out across every actuator of every joint (`motion.ex:394-411`). If one actuator refuses on ownership, the others still move — a partially-applied pose. Should `send_positions/3` pre-check ownership and refuse as a unit?
+8. **Whether `bb_pid_controller` and `bb_policy` should acquire leases automatically or leave it to the user.** Automatic is safer and matches intent; explicit is less surprising and avoids a controller monopolising a joint the user wanted to share.
+
+9. **Interaction with `BB.Motion`'s multi-actuator sends.** `send_positions/3` fans out across every actuator of every joint (`motion.ex:394-411`). If one actuator refuses on ownership, the others still move — a partially-applied pose. Should `send_positions/3` pre-check ownership and refuse as a unit?
+
+10. **Does narrowing via `command_payloads/1` warrant an error rather than a drop?** A driver that declares `[Command.Effort]` and is then sent a `Command.Position` currently sees nothing: the subscription filters it and the dispatch guard drops it. That's right for pubsub, where the sender may be addressing a whole subtree, but a `set_position_sync/5` caller arguably deserves `{:error, …}` rather than `{:ok, :accepted}` for a command the actuator structurally cannot accept.
 
 ---
 
 ## References
 
+- [beam-bots/bb#204](https://github.com/beam-bots/bb/pull/204) — the Phase 1 and 3 implementation, released as bb 0.23.0.
+- [lostbean/bb_mcuhub#12](https://github.com/lostbean/bb_mcuhub/pull/12) — the third-party migration that surfaced the `command_payloads/1` gap. Its actuator was the only one in the ecosystem to get the subscription right, and the only one to derive its accepted payload rather than hard-code it.
 - [beam-bots/bb#201](https://github.com/beam-bots/bb/issues/201) — `BB.Actuator.Server` never subscribes to `[:actuator | path]`; source issue for the pipeline half of this proposal.
 - [beam-bots/bb#148](https://github.com/beam-bots/bb/issues/148) — no actuator ownership or arbitration; source issue for the lease half.
 - [Proposal 0018: BB.Estimator](0018-bb-estimator.md) — precedent for a wrapper GenServer owning subscriptions on behalf of a callback module (`bb/lib/bb/estimator/server.ex:168`) and for a single named inbound callback. This proposal borrows the callback unification and deliberately does not borrow the declared-input DSL.
