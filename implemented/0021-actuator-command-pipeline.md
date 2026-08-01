@@ -6,13 +6,21 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal 0021: Actuator Command Pipeline
 
-**Status:** In Progress
+**Status:** Implemented
 **Author:** James Harton
 **Created:** 2026-07-31
 
-Phases 1 and 3 shipped in [bb 0.23.0](https://github.com/beam-bots/bb/pull/204), along with
-the driver migrations in Phase 4. Phase 2 — ownership, and the `command_payloads/1`
-extension point it brought to light — is outstanding.
+Shipped across bb 0.23.0, 0.24.0 and 0.25.0, plus migrations in six packages.
+
+**Ownership and arbitration are deliberately deferred.** Everything else in this
+proposal is implemented; the arbiter is not, and won't be until there's a
+concrete case for it. The reasoning is in "Ownership: deferred" below — in
+short, the robot state machine already serialises commands, so the race is
+narrower than it first appeared, and the design questions it raises are better
+answered by a real conflict than by speculation. [beam-bots/bb#148] stays open
+to track it.
+
+[beam-bots/bb#148]: https://github.com/beam-bots/bb/issues/148
 
 ---
 
@@ -104,7 +112,11 @@ BB.Actuator.set_position_sync(robot, name, x) ─┘         │
 
 Choosing a transport cannot dodge a gate. The gates run in the order above so the more specific rejection wins: a non-owner learns it doesn't own the actuator rather than being told the robot is disarmed.
 
-`BB.Message.Actuator.Command.Stop` bypasses both gates. Stopping is the fail-safe direction, and a safety supervisor must be able to stop a joint it neither owns nor armed. `Command.Hold` does **not** bypass the arm gate — holding energises hardware to maintain position.
+Nothing bypasses the gates — not even `Command.Stop`.
+
+An earlier draft exempted `Stop`, on the grounds that stopping is the fail-safe direction and a safety supervisor must be able to stop a joint it neither owns nor armed. That was a misreading, and it shipped in 0.23 before being reversed in 0.25. `Stop` documents itself as ceasing an actuator's *motion*, after which it "becomes passive and will not actively resist external forces" — the counterpart to `Command.Hold`, which maintains position. Its `:decelerate` mode settles the question: nothing that slows down smoothly is an emergency stop.
+
+Making hardware safe is `disarm/1`, which is robot-wide and leaves the robot unable to move until re-armed. `BB.Error.Safety.EmergencyStop` is the separate safety concept. Conflating a motion command with a safety mechanism bought two special cases and no safety, and the second was actively harmful: admitting `Stop` regardless of `command_payloads/1` could hand a driver a payload it never declared and has no clause for.
 
 ### `handle_command/2`
 
@@ -369,7 +381,23 @@ BB.Actuator.owner(MyRobot, :shoulder_servo)
 - [x] `BB.Sim.Actuator` migrated; `test/support/recording_actuator.ex` no longer self-subscribes
 - [x] Test proving a pubsub command reaches a driver *without* the driver subscribing
 
-#### Phase 2 — ownership and the command vocabulary
+#### Phase 2 — the command vocabulary (shipped in bb 0.25.0)
+
+- [x] `command_payloads/1` optional callback, defaulted to the six built-ins
+- [x] The callback drives both the `message_types` subscription filter and the dispatch guard, so narrowing holds across all three transports
+- [x] Test proving a bespoke command payload reaches `handle_command/2` *and* is refused while disarmed — i.e. enters the pipeline rather than bypassing it
+- [x] `BB.Error.State.UnsupportedCommand`, with `:unsupported_command` telemetry
+- [x] No exemptions: a command is delivered only if the actuator declared the payload and the robot is armed
+
+#### Ownership — deferred
+
+Not implemented, and not scheduled. [beam-bots/bb#148](https://github.com/beam-bots/bb/issues/148) tracks it.
+
+The design below stands as written and is worth keeping, but two things argued for waiting.
+
+The robot state machine already serialises commands globally — `:idle → :executing → :idle`, one at a time — so two *commands* cannot race. The gap is narrower than the issue suggests: it's between the command system and commanders outside it, which today means a `BB.Controller` running its own loop, a policy runner, or an ad-hoc `set_position!/4`. Real, but narrower, and it changes what the right model is.
+
+That in turn raises a question the design doesn't answer: should an executing command implicitly own what it touches, should leases only bind non-command commanders, or are they simply orthogonal? Each gives different behaviour when a command meets a PID loop, and picking between them from first principles risks building the wrong one. A concrete conflict will answer it in a sentence.
 
 - [ ] `BB.Actuator.Arbiter` per robot, in the root supervision tree, owning a public-read ETS table
 - [ ] `acquire/3`, `release/2`, `owner/2`; actuator, joint and list targets; joint acquisition all-or-nothing
@@ -378,18 +406,16 @@ BB.Actuator.owner(MyRobot, :shoulder_servo)
 - [ ] Displaced owner receives `{:bb_lease_revoked, …}`
 - [ ] Owner death releases the lease via monitor
 - [ ] Leases survive disarm and re-arm
-- [ ] `command_payloads/1` optional callback, defaulted to the six built-ins
-- [ ] The callback drives both the `message_types` subscription filter and the dispatch guard, so narrowing holds across all three transports
-- [ ] Test proving a bespoke command payload reaches `handle_command/2` *and* is refused while disarmed — i.e. enters the pipeline rather than bypassing it
 
-#### Phase 3 — addressing and docs
+#### Phase 3 — addressing and docs (shipped in bb 0.24.0)
 
-- [ ] `BB.Robot.actuator_path/2` public; `BB.Motion`'s private copy removed
-- [ ] Pubsub API accepts an actuator name or a full path
+- [x] `BB.Robot.actuator_path/2` public; `BB.Motion`'s private copy removed
+- [x] Pubsub API accepts an actuator name or a full path
 - [x] Tutorial 12 rewritten around `handle_command/2`; inbound diagram corrected
 - [x] `usage-rules/actuators.md` corrected — path example and the driver contract
 - [x] `documentation/how-to/integrate-servo-driver.md` corrected — it carried the fullest version of the old contract
-- [ ] Ownership documented, including the unleased default
+- [ ] ~~Ownership documented, including the unleased default~~ — deferred with the arbiter
+- [x] Every robot definition in bb's own docs fixed, and `mix bb.verify_docs` added to `mix check` — none had ever been compiled, and six didn't
 
 #### Phase 4 — ecosystem
 
@@ -397,14 +423,17 @@ BB.Actuator.owner(MyRobot, :shoulder_servo)
 - [x] feetech, robotis, pca9685, pigpio migrated, self-subscriptions and `armed?` checks removed
 - [x] `bb_ik_fabrik`'s test mock actuator migrated
 - [x] `bb_pid_controller` and `bb_policy` verified end to end — neither needed a source change
-- [ ] Third-party packages notified: `lostbean/bb_mcuhub` (PR open), `mcass19/bb_tui` (unaffected)
+- [x] `bb` 0.24.0 and 0.25.0 released; all four servo drivers released against them
+- [x] pca9685 and pigpio now act on `Command.Stop` rather than swallowing it; [feetech#86](https://github.com/beam-bots/bb_servo_feetech/issues/86) and [robotis#85](https://github.com/beam-bots/bb_servo_robotis/issues/85) track the same for the bus drivers, alongside velocity and effort support
+- [ ] Third-party packages notified: `lostbean/bb_mcuhub` ([PR open](https://github.com/lostbean/bb_mcuhub/pull/12)), `mcass19/bb_tui` (unaffected)
 
 ### Should Have
 
-- [ ] `bb_pid_controller` acquires a lease for its output actuator, with a configurable priority
-- [ ] `bb_policy`'s runner acquires leases for the joints it drives
-- [ ] Telemetry for accepted commands, rejections with reason, and lease transitions
-- [ ] A named priority scheme (`:background`, `:autonomous`, `:teleop`, `:safety`) over bare integers
+- [x] Telemetry for rejections, with a reason
+- [ ] The four servo drivers narrow `command_payloads/1` to what they implement
+- [ ] ~~`bb_pid_controller` acquires a lease for its output actuator~~ — deferred with the arbiter
+- [ ] ~~`bb_policy`'s runner acquires leases for the joints it drives~~ — deferred with the arbiter
+- [ ] ~~A named priority scheme over bare integers~~ — deferred with the arbiter
 
 ### Won't Have
 
