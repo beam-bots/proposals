@@ -6,9 +6,14 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal: bb_mcp
 
-**Status:** Draft
+**Status:** Implemented
 **Author:** James Harton
 **Created:** 2026-01-11
+
+Implemented in `beam-bots/bb_mcp` (v0.1.1 on Hex). The protocol layer is not
+hand-rolled as described here — it delegates to `anubis_mcp` — and the transport
+story came out differently, which has a user-visible consequence. See "As
+shipped".
 
 ---
 
@@ -561,36 +566,102 @@ Supervisor.start_link(children, strategy: :one_for_one)
 
 ### Must Have
 
-- [ ] `BB.MCP.Server` GenServer handling JSON-RPC 2.0 protocol
-- [ ] MCP initialization handshake (protocol version negotiation)
-- [ ] Tool discovery via `tools/list`
-- [ ] Tool invocation via `tools/call`
-- [ ] Base tools: `arm`, `disarm`, `get_state`
-- [ ] Parameter tools: `list_parameters`, `get_parameter`, `set_parameter`
-- [ ] Dynamic tool generation from robot commands
-- [ ] Resource discovery via `resources/list`
-- [ ] Resource reading via `resources/read`
-- [ ] Resources: state, joints, safety, parameters
+- [x] `BB.MCP.Server` GenServer handling JSON-RPC 2.0 protocol — via `anubis_mcp`
+- [x] MCP initialization handshake (protocol version negotiation)
+- [x] Tool discovery via `tools/list`
+- [x] Tool invocation via `tools/call`
+- [x] Base tools: `arm`, `disarm`, `get_state` — arm/disarm arrive as dynamic per-robot command tools
+- [x] Parameter tools: `list_parameters`, `get_parameter`, `set_parameter`
+- [x] Dynamic tool generation from robot commands
+- [x] Resource discovery via `resources/list`
+- [x] Resource reading via `resources/read`
+- [x] Resources: state, joints, safety, parameters — safety folded into the state resource
 - [ ] Stdio transport for local connections
 - [ ] Documentation with Claude Desktop setup example
-- [ ] Tests for protocol handling and tool execution
+- [x] Tests for protocol handling and tool execution
 
 ### Should Have
 
 - [ ] Prompt discovery via `prompts/list`
 - [ ] Prompt templates for control, configure, and debug
-- [ ] SSE transport for remote connections
-- [ ] PubSub event streaming to clients
+- [ ] SSE transport for remote connections — superseded by Streamable HTTP
+- [x] PubSub event streaming to clients — buffered and pulled, not pushed
 - [ ] Sensor resources (dynamic from robot definition)
 - [ ] Individual parameter resources
-- [ ] Error handling with structured error responses
+- [x] Error handling with structured error responses
 
 ### Won't Have
 
 - [ ] Authentication/authorisation (use network-level security)
-- [ ] Multi-robot support in single server (run multiple servers)
+- [x] Multi-robot support in single server (run multiple servers) — shipped anyway
 - [ ] WebSocket transport (SSE is sufficient)
 - [ ] Custom tool definitions beyond robot commands
+
+---
+
+## As shipped
+
+### The protocol layer is `anubis_mcp`, not hand-rolled
+
+The Design section below specifies a `BB.MCP.Server` GenServer implementing
+JSON-RPC 2.0, the initialize handshake and the `tools/*` and `resources/*`
+methods directly. None of that was written. `BB.MCP.Server` is
+`use Anubis.Server`, and the protocol, handshake, dispatch and schema plumbing
+come from the [`anubis_mcp`](https://hex.pm/packages/anubis_mcp) dependency.
+`bb_mcp` supplies only the BB-shaped parts: nine `component`-registered tools,
+six resources, dynamic per-robot command-tool registration, and the event buffer.
+
+Consequently `BB.MCP.Transport.Stdio` and `BB.MCP.Transport.SSE` — both given
+full module bodies below — do not exist in any form. Transports are Anubis's.
+
+### There is no stdio transport, and therefore no Claude Desktop story
+
+The only transport wired up is Streamable HTTP: `{BB.MCP.Server, transport:
+:streamable_http, streamable_http: [port: 4000]}`, or `bb_mcp "/mcp"` mounted in
+a Phoenix router via `BB.MCP.Router`. Nothing in the package mentions stdio.
+
+These two unmet must-haves are the same gap. Claude Desktop launches MCP servers
+as subprocesses over stdio, so without a stdio transport there is no Claude
+Desktop setup to document — the README's reference to Claude Desktop is an
+aspiration, not an instruction. Clients that speak Streamable HTTP (including
+Claude Code) work fine.
+
+SSE, listed as a should-have, is moot: the MCP specification replaced the
+HTTP+SSE transport with Streamable HTTP, and Anubis implements the latter. The
+requirement is met in spirit by a transport that didn't exist when this was
+written.
+
+### Prompts were never built
+
+`prompts/list`, the prompt templates, and the `BB.MCP.Prompts` module sketched
+below are absent. Instead, the guidance those templates would have carried lives
+in `server_instructions/0` — a single block of prose telling the client to start
+with `list_robots`, how the `{robot}.{command}` tool naming works, which tools
+are cross-cutting, and that robots must be armed before motion commands run.
+That covers the "control" template's purpose and none of the others'.
+
+### Event streaming is pull, not push
+
+The should-have reads "PubSub event streaming to clients". What shipped is
+`BB.MCP.EventBuffer` — not the `BB.MCP.EventStream` named below — a fixed-capacity
+ring buffer per session. The server subscribes to each robot's pubsub on
+connect and buffers everything; clients retrieve events with the `query_events`
+tool. Nothing is pushed to the client. For an agent inspecting command outcomes
+between tool calls this is the more useful shape, but it is not streaming.
+
+### Multi-robot shipped despite being ruled out
+
+"Multi-robot support in single server (run multiple servers)" is under Won't
+Have. One server exposes every robot in `config :bb_mcp, robots: [...]`;
+cross-cutting tools take a `robot` argument and command tools are namespaced
+`{robot}.{command}`. Resources are URI-templated by robot name.
+
+### Two resource should-haves went unmet
+
+There are no per-sensor resources and no individual parameter resources.
+`BB.MCP.Resources.RobotParameters` returns the whole parameter set, and
+`RobotTopology` covers structural introspection in place of dynamic sensor
+resources.
 
 ---
 

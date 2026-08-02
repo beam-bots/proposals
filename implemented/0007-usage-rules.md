@@ -1,8 +1,11 @@
 # Proposal: Usage Rules for Beam Bots Packages
 
-**Status:** Accepted
+**Status:** Implemented
 **Author:** James Harton
 **Created:** 2026-01-13
+
+Every published package now ships a `usage-rules.md`. See "As shipped" below for
+the one must-have that remains open.
 
 ---
 
@@ -220,22 +223,51 @@ Local deps: `deps/<package>/usage-rules.md`
 
 ### Must Have
 
-- [ ] `bb` has `usage-rules.md` covering DSL, safety, commands, kinematics
-- [ ] All servo driver packages have `usage-rules.md`
-- [ ] All IK solver packages have `usage-rules.md`
-- [ ] `bb_liveview` has `usage-rules.md`
-- [ ] All files added to `package/0` files list for hex distribution
+- [x] `bb` has `usage-rules.md` covering DSL, safety, commands, kinematics
+- [x] All servo driver packages have `usage-rules.md`
+- [x] All IK solver packages have `usage-rules.md`
+- [x] `bb_liveview` has `usage-rules.md`
+- [x] All files added to `package/0` files list for hex distribution
 - [ ] Workspace `CLAUDE.md` updated to reference usage rules
 
 ### Should Have
 
-- [ ] `bb_kino` has `usage-rules.md`
-- [ ] `bb_reactor` has `usage-rules.md`
+- [x] `bb_kino` has `usage-rules.md`
+- [x] `bb_reactor` has `usage-rules.md`
 
 ### Won't Have
 
 - [ ] `bb_example_*` packages (apps, not libraries)
 - [ ] Exhaustive documentation (that's what hexdocs is for)
+
+---
+
+## As shipped
+
+Coverage went wider than the proposal asked for. Every library package in the
+ecosystem carries a `usage-rules.md`, not just the servo drivers, IK solvers and
+`bb_liveview` named above: the sensors, estimators, controllers, orchestration
+and surface packages all have one, as do satellites that postdate this proposal.
+
+`bb` went further still and split its rules into a `usage-rules/` directory of
+topic sub-rules alongside the top-level file, both listed in its `package/0`
+`files` list. Satellites ship the single file.
+
+Two things named here did not happen:
+
+- **The workspace `CLAUDE.md` was never updated.** `bb_workspace/AGENTS.md`
+  doesn't mention usage rules at all. The lookup instruction lives only in
+  individual contributors' personal agent configuration, which is not a
+  substitute — a new contributor cloning the workspace gets no signal that
+  `mix usage_rules.docs` is the right first move.
+- **No CI check exists** for the presence of `usage-rules.md` or its inclusion
+  in `package/0`. This was raised as an open question rather than a criterion,
+  and stays open: nothing stops a new satellite shipping without one, or an
+  existing one dropping the file from its `files` list and silently publishing
+  a hex package with no rules in it.
+
+`usage_rules` is a dev-only dependency everywhere, settling the first open
+question.
 
 ---
 

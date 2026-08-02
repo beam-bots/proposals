@@ -6,9 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal: bb_jido
 
-**Status:** Accepted
+**Status:** Implemented
 **Author:** James Harton
 **Created:** 2026-01-20
+**Implemented:** 2026 — `beam-bots/bb_jido` v0.1.4 on Hex; see "As shipped"
 **Updated:** 2026-03-29 — incorporated implementation analysis from @houllette
 **Updated:** 2026-05-18 — aligned with Jido v2.2 (instance-scoped supervision, Skill→Plugin rename, removal of `actions:` on `use Jido.Agent`, removal of `handle_instruction`/`handle_signal` agent callbacks)
 **Dependencies:** `bb_reactor` (optional, for workflow integration)
@@ -609,21 +610,21 @@ end
 
 ### Must Have
 
-- [ ] `BB.Jido.Action.Command` - Execute BB commands as Jido actions
-- [ ] `BB.Jido.Action.Reactor` - Run BB.Reactor workflows as Jido actions
-- [ ] `BB.Jido.PubSubBridge` + `BB.Jido.Signal` - Bridge BB.PubSub events to Jido signals
-- [ ] `BB.Jido.Plugin.Robot` - Jido v2 plugin that owns robot state, default actions, and default signal routes; mounts the PubSubBridge
-- [ ] Safety integration - Actions respect BB.Safety state
-- [ ] Documentation with examples
-- [ ] Tests for action execution and signal bridging
+- [x] `BB.Jido.Action.Command` - Execute BB commands as Jido actions
+- [x] `BB.Jido.Action.Reactor` - Run BB.Reactor workflows as Jido actions
+- [x] `BB.Jido.PubSubBridge` + `BB.Jido.Signal` - Bridge BB.PubSub events to Jido signals
+- [x] `BB.Jido.Plugin.Robot` - Jido v2 plugin that owns robot state, default actions, and default signal routes; mounts the PubSubBridge
+- [x] Safety integration - Actions respect BB.Safety state
+- [x] Documentation with examples
+- [x] Tests for action execution and signal bridging
 
 ### Should Have
 
-- [ ] `BB.Jido.Action.WaitForState` - Wait for robot state machine transition
-- [ ] `BB.Jido.Action.GetJointState` - Read current joint positions
-- [ ] `BB.Jido.Action.SafetyAware` - Mixin for safety-checking actions
-- [ ] Example: simple agent controlling simulated robot
-- [ ] Telemetry integration
+- [x] `BB.Jido.Action.WaitForState` - Wait for robot state machine transition
+- [x] `BB.Jido.Action.GetJointState` - Read current joint positions
+- [x] `BB.Jido.Action.SafetyAware` - Mixin for safety-checking actions
+- [x] Example: simple agent controlling simulated robot — as a tutorial, not an example app
+- [x] Telemetry integration
 
 ### Won't Have
 
@@ -777,6 +778,49 @@ Estimates assume one experienced Elixir developer, excluding review/iteration.
 
 - **Strictly required:** none — `bb_jido` uses `Reactor.run/3` with `context.private[:bb_robot]` and treats Safety middleware as opt-in
 - **Nice-to-have (future):** extract shared "command execution + await + safety mapping" logic from `BB.Reactor.Step.Command` so `BB.Jido.Action.Command` can reuse it
+
+---
+
+## As shipped
+
+Every must-have and should-have landed. The Implementation Analysis above is
+the accurate part of this document — its API corrections table was written
+against the real Jido v2 API and the implementation followed it, so the code
+sketches in the *Design* section (written against Jido v1.2 and an incorrect
+PubSub message shape) should be read as superseded by that table rather than as
+specification.
+
+`bb_jido` is v0.1.4 on Hex, tracking `{:jido, "~> 2.3"}` — a minor ahead of the
+`~> 2.2` this proposal was aligned to.
+
+### `BB.Jido.Action.WaitForEvent` was not built
+
+It appears in the Interface Mapping table and as the sole P2 in the task
+breakdown, hedged there with "blocking waits inside AgentServer need care;
+consider async strategy". It never shipped, and it was never an acceptance
+criterion. `BB.Jido.Action.WaitForState` covers the state-machine case; there is
+no general wait-for-arbitrary-pubsub-event action. Agents observe events by
+routing bridged signals instead, which is the shape the plugin encourages.
+
+### Shipped beyond the criteria
+
+- `BB.Jido.Action.RecordSafetyError` and `BB.Jido.Action.UpdateSafetyState` —
+  default actions on the robot plugin keeping agent-side safety state in sync
+  with what arrives over pubsub.
+- A full Igniter surface: `mix igniter.install bb_jido --robot MyApp.Robot`
+  plus `mix bb_jido.add_agent`, `add_action` and `add_jido_instance`.
+- `bb_reactor` stayed an optional dependency, as the analysis predicted.
+
+### The example app became documentation
+
+The should-have asked for "a simple agent controlling a simulated robot", and
+the task breakdown listed an `examples/simple_agent/` app for CI. There is no
+`examples/` directory. The same ground is covered by three tutorials —
+`01-your-first-agent`, `02-reacting-to-pubsub`, `03-running-workflows` — which
+run against a robot in `simulation: :kinematic`, alongside six how-to guides and
+four reference pages. The end-to-end scenario is exercised by
+`test/bb/jido/plugin/robot_integration_test.exs` rather than by a runnable
+example app.
 
 ---
 

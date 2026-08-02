@@ -6,10 +6,16 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal: bb_policy
 
-**Status:** Draft
+**Status:** Implemented
 **Author:** James Harton
 **Created:** 2026-01-11
-**Dependencies:** `bb_teleop` (for demonstration collection), `bb_dataset` (for training data)
+**Dependencies:** `bb_teleop` (for demonstration collection), `bb_dataset` (for
+training data) — neither was built; see "As shipped" below
+
+Implemented in `beam-bots/bb_policy`, unreleased at v0.1.0. The package diverges
+from this proposal in two places worth reading before you use it as a
+specification: the public entry point, and what "safety integration" turned out
+to mean. Both are in "As shipped".
 
 ---
 
@@ -515,25 +521,25 @@ end
 
 ### Must Have
 
-- [ ] `BB.Policy` behaviour with `init/1`, `reset/1`, `observe/3`, `act/2`, `action_to_commands/3`
-- [ ] `BB.Policy.Runner` GenServer executing control loop at configurable rate
-- [ ] `BB.Policy.Normalizer` for observation/action normalisation (min-max and z-score)
-- [ ] `BB.Policy.ONNX` implementation loading models via Ortex
-- [ ] Integration with `BB.Motion.run_policy/4`
-- [ ] Safety system integration (joint limits, velocity limits enforced)
-- [ ] Timeout handling (policies don't run forever)
-- [ ] Basic telemetry (inference time, step count)
-- [ ] Documentation with ONNX export examples
-- [ ] Tests for behaviour contract, runner lifecycle, normalisation
+- [x] `BB.Policy` behaviour with `init/1`, `reset/1`, `observe/3`, `act/2`, `action_to_commands/3`
+- [x] `BB.Policy.Runner` GenServer executing control loop at configurable rate
+- [x] `BB.Policy.Normalizer` for observation/action normalisation (min-max and z-score)
+- [x] `BB.Policy.ONNX` implementation loading models via Ortex
+- [ ] Integration with `BB.Motion.run_policy/4` — shipped as `BB.Policy.run/4`
+- [ ] Safety system integration (joint limits, velocity limits enforced) — arm gating only
+- [x] Timeout handling (policies don't run forever)
+- [x] Basic telemetry (inference time, step count)
+- [x] Documentation with ONNX export examples
+- [x] Tests for behaviour contract, runner lifecycle, normalisation
 
 ### Should Have
 
-- [ ] `BB.Policy.Command` wrapper for reactor integration
-- [ ] Normalisation statistics loading from JSON file
-- [ ] GPU acceleration configuration (CUDA via Ortex)
-- [ ] Graceful degradation on inference failure
-- [ ] Episode reset handling (clear hidden state)
-- [ ] Example: simple ONNX policy running on simulated robot
+- [x] `BB.Policy.Command` wrapper for reactor integration
+- [x] Normalisation statistics loading from JSON file
+- [x] GPU acceleration configuration (CUDA via Ortex)
+- [x] Graceful degradation on inference failure
+- [x] Episode reset handling (clear hidden state)
+- [x] Example: simple ONNX policy running on simulated robot
 
 ### Won't Have
 
@@ -543,6 +549,61 @@ end
 - [ ] Dataset management (separate `bb_dataset`)
 - [ ] Vision encoders (separate `bb_vision`)
 - [ ] Python bridge (separate `bb_policy_pythonx`)
+
+---
+
+## As shipped
+
+`bb_policy` implements this proposal at v0.1.0, unreleased — no git tags, not on
+Hex. `BB.Policy`, `.Runner`, `.Normalizer`, `.ONNX`, `.Command`, `.Controller`,
+`.Telemetry`, `.ActuatorCommand`, `.Effect` and `.Step` are all built and tested.
+The package's own `PROJECT_PLAN.md` is the authoritative record of *how* it was
+built; this section covers only where the shipped package departs from what's
+specified above.
+
+### The entry point is `BB.Policy.run/4`, not `BB.Motion.run_policy/4`
+
+`BB.Motion` lives in core and exposes no registration hook a satellite can use
+to add a function to it, so the proposal's `BB.Motion.run_policy/4` was not
+implementable from `bb_policy`. The public API is `BB.Policy.run/4`, a thin
+delegate to `BB.Policy.Runner.run/4`. Adding the core-side convenience delegate
+is a separate change to `bb` and was not treated as a blocker.
+
+Every `BB.Motion.run_policy/4` call in the Design and User Experience sections
+above should be read as `BB.Policy.run/4`.
+
+### "Safety integration" means arm gating, not limit enforcement
+
+The must-have reads "joint limits, velocity limits enforced". What shipped is
+arm-state gating: `BB.Policy.Runner`, `.Controller` and `.Step` all check
+`BB.Safety.armed?/1`, and a disarm ends the episode with reason `:disarmed`.
+
+Joint and velocity limits are **not** clamped anywhere on the policy path.
+Limits are declared in the core DSL (`BB.Dsl.Limit`) and enforced by `BB.Motion`
+and `BB.Command.MoveTo`; a policy bypasses both, emitting actuator commands
+directly, and `BB.Actuator.Server` does no limit checking of its own. A policy
+that emits an out-of-range joint position will have it delivered to the servo.
+
+This is the gap to close before anyone runs a policy on hardware that can hurt
+itself. Whether it closes in `bb_policy` or in the core actuator pipeline
+(proposal 0021 established the framework-owned inbound path where such a gate
+would naturally sit) is undecided.
+
+### Two runner shapes, not one
+
+The proposal models the runner as a plain GenServer with `run/4`. That shipped,
+and so did a `BB.Policy.Controller` built on `use BB.Controller`, for policies
+that should live in the robot DSL as a continuously-running loop rather than an
+episodic task. The control-loop body is shared between them.
+
+### The declared dependencies were never built
+
+This proposal lists `bb_teleop` (demonstration collection) and `bb_dataset`
+(training data) as dependencies. Both remain unbuilt proposals — 0001 and 0003.
+`bb_policy` has no dependency on either: it executes policies trained elsewhere
+by whatever means, and reads its normalisation statistics from a JSON file via
+`BB.Policy.Normalizer.load/1`. Nothing in the package assumes a BB-native
+training or dataset pipeline, so 0001 and 0003 landing later would be additive.
 
 ---
 

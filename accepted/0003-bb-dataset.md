@@ -6,10 +6,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal: bb_dataset
 
-**Status:** Draft
+**Status:** Accepted
 **Author:** James Harton
 **Created:** 2026-01-11
-**Dependencies:** `bb_teleop` (for demonstration collection)
+**Dependencies:** `bb_teleop` (for demonstration collection) — not yet built
 **Dependents:** `bb_policy` (consumes datasets for deployment), `bb_training` (future)
 
 ---

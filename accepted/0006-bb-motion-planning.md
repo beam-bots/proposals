@@ -6,6 +6,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal 0006: bb_motion_planning
 
+**Status:** Accepted
+**Author:** James Harton
+**Created:** 2026-01-11
+
+---
+
 ## Summary
 
 A motion planning package for Beam Bots that provides sampling-based path planning, trajectory interpolation, and time parameterisation. Builds on BB's existing collision detection to enable collision-free motion planning.

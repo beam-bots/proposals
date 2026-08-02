@@ -6,9 +6,16 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal: bb_tui
 
-**Status:** Draft
+**Status:** Implemented
 **Author:** James Harton
 **Created:** 2026-01-11
+**Implementation:** [`mcass19/bb_tui`](https://github.com/mcass19/bb_tui) —
+community-owned, outside the `beam-bots` org
+
+Implemented independently by [@mcass19](https://github.com/mcass19) and
+published to Hex as [`bb_tui`](https://hex.pm/packages/bb_tui) (v0.3.1,
+Apache-2.0). It goes well beyond what's specified here. See "As shipped" for
+what differs and for what its existence means for the package name.
 
 ---
 
@@ -482,30 +489,30 @@ mix bb.tui MyRobot
 
 ### Must Have
 
-- [ ] Ratatouille-based full-screen terminal application
-- [ ] Safety panel with arm/disarm controls
-- [ ] State display (robot state machine state)
-- [ ] Joints table with current positions
-- [ ] Real-time updates via PubSub subscription
-- [ ] Keyboard navigation between panels
-- [ ] Basic keyboard shortcuts (quit, arm, disarm)
-- [ ] `mix bb.tui` task for launching
-- [ ] Documentation with usage examples
-- [ ] Tests for model and update logic
+- [ ] Ratatouille-based full-screen terminal application — built on ExRatatui
+- [x] Safety panel with arm/disarm controls
+- [x] State display (robot state machine state)
+- [x] Joints table with current positions
+- [x] Real-time updates via PubSub subscription
+- [x] Keyboard navigation between panels
+- [x] Basic keyboard shortcuts (quit, arm, disarm)
+- [x] `mix bb.tui` task for launching
+- [x] Documentation with usage examples
+- [x] Tests for model and update logic
 
 ### Should Have
 
-- [ ] Event stream panel with scrolling
-- [ ] Command execution (select and run commands)
-- [ ] Parameter viewing
-- [ ] Parameter editing (simple types)
-- [ ] Help overlay (`?` key)
-- [ ] Colour-coded status indicators
-- [ ] Joint limit warnings (highlight when near limits)
+- [x] Event stream panel with scrolling
+- [x] Command execution (select and run commands)
+- [x] Parameter viewing
+- [x] Parameter editing (simple types)
+- [x] Help overlay (`?` key)
+- [x] Colour-coded status indicators
+- [x] Joint limit warnings (highlight when near limits)
 
 ### Could Have
 
-- [ ] ASCII art joint diagram (simple kinematic visualisation)
+- [x] ASCII art joint diagram (simple kinematic visualisation) — shipped as real 3D
 - [ ] Command history
 - [ ] Log file export
 - [ ] Configuration file for keybindings
@@ -514,10 +521,56 @@ mix bb.tui MyRobot
 
 ### Won't Have
 
-- [ ] 3D visualisation (terminal limitation)
+- [x] 3D visualisation (terminal limitation) — shipped anyway
 - [ ] Complex parameter types (use bb_liveview for those)
 - [ ] Video/camera display
 - [ ] Touch screen support
+
+---
+
+## As shipped
+
+`mcass19/bb_tui` covers every must-have except the choice of rendering library,
+and every should-have. It also shipped one thing this proposal ruled out as
+impossible.
+
+### It's built on ExRatatui, not Ratatouille
+
+The whole Design section below assumes Ratatouille and its Elm-architecture
+split — `BB.TUI.Application`, `.Model`, `.Update`, `.View`. None of those modules
+exist. The implementation uses [ExRatatui](https://github.com/mcass19/ex_ratatui),
+a Rust `ratatui` binding by the same author, and organises itself as
+`BB.TUI.App`, a `BB.TUI.State` tree (`.Commands`, `.Events`, `.Joints`,
+`.Parameters`, `.Power`, `.Safety`, `.Throttle`, `.Ui`, `.Viz`) and a
+`BB.TUI.Panels.*` module per panel. Read the module names in this proposal as
+illustrative only.
+
+### 3D visualisation happened
+
+"3D visualisation (terminal limitation)" is listed under Won't Have. It shipped:
+a Visualization tab renders the live robot from its URDF topology and joint
+positions with an orbitable, zoomable camera, using pixel graphics on capable
+terminals (Ghostty, WezTerm, Kitty) and falling back to braille over SSH. The
+terminal limitation turned out not to be one.
+
+### It went further in several other directions
+
+Not asked for here, but shipped: three transports (local, SSH with isolated
+per-operator sessions, and Erlang distribution for attaching a thin renderer to
+a TUI running on the robot node); an Igniter installer (`mix igniter.install
+bb_tui`) with Nerves and SSH-daemon wiring; a `BB.TUI.Renderer` behaviour letting
+consumers render their own PubSub payloads without `bb_tui` depending on their
+structs; render coalescing and event-log debouncing so high-rate telemetry can't
+stall the UI; and a `usage-rules.md`, per proposal 0007.
+
+### The package name is taken
+
+`bb_tui` on Hex is this package, owned by @mcass19. The `beam-bots` org cannot
+publish under that name. This is only a problem if the org ever wants a
+first-party terminal dashboard — and given the state of this one, it shouldn't.
+The practical consequences are that the ecosystem's terminal UI lives outside
+the org under an Apache-2.0 licence and a maintainer the org doesn't control,
+and that `bb-sync` will never clone it into the workspace.
 
 ---
 

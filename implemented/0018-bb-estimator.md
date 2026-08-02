@@ -10,6 +10,12 @@ SPDX-License-Identifier: Apache-2.0
 **Author:** James Harton
 **Created:** 2026-05-26
 
+All four phases shipped, in `bb` core and in `bb_estimator_ahrs` (v0.2.0). The
+module names used throughout this document do **not** match what shipped — the
+AHRS package is `bb_estimator_ahrs`, not `bb_ahrs`, and its algorithms are
+`BB.Estimator.Ahrs.*`, not `BB.Ahrs.*`. Read "As shipped" before copying any
+example below.
+
 ---
 
 ## Summary
@@ -716,46 +722,46 @@ The verifier rejects cycles in this graph.
 
 #### Phase 1 — Estimator behaviour and DSL
 
-- [ ] `BB.Estimator` behaviour with `init`, `handle_input`, `handle_info`, `handle_call`, `handle_options`, `terminate`, `options_schema` callbacks.
-- [ ] `BB.Estimator.Server` framework wrapper handling subscription, single-vs-multi input dispatch, driver/sync_tolerance multi-input fan-in, dt tracking, output routing, telemetry.
-- [ ] `BB.Estimator.Context` struct delivered to estimator `init/1` via the `__context__` opt.
-- [ ] `estimator` DSL entity, nestable inside `sensor` (single-input) or `link` (single or multi-input).
-- [ ] `input :key, path, driver: true|false` form for multi-input estimators.
-- [ ] `output :name, ...` form for multi-output estimators (default implicit `:out`).
-- [ ] Compile-time verifier: path resolution, single/multi consistency, driver constraint, cycle detection, command name resolution, transform feasibility.
-- [ ] Single-output estimators publish to `[:sensor, link, sensor, estimator]` (sensor-nested) or `[:estimator, link, estimator]` (link-nested).
-- [ ] Static frame-to-target-frame transforms precomputed and delivered via init context.
+- [x] `BB.Estimator` behaviour with `init`, `handle_input`, `handle_info`, `handle_call`, `handle_options`, `terminate`, `options_schema` callbacks.
+- [x] `BB.Estimator.Server` framework wrapper handling subscription, single-vs-multi input dispatch, driver/sync_tolerance multi-input fan-in, dt tracking, output routing, telemetry.
+- [x] `BB.Estimator.Context` struct delivered to estimator `init/1` via the `__context__` opt.
+- [x] `estimator` DSL entity, nestable inside `sensor` (single-input) or `link` (single or multi-input).
+- [x] `input :key, path, driver: true|false` form for multi-input estimators — shipped as `driver?:`
+- [x] `output :name, ...` form for multi-output estimators (default implicit `:out`).
+- [x] Compile-time verifier: path resolution, single/multi consistency, driver constraint, cycle detection, command name resolution, transform feasibility.
+- [x] Single-output estimators publish to `[:sensor, link, sensor, estimator]` (sensor-nested) or `[:estimator, link, estimator]` (link-nested).
+- [x] Static frame-to-target-frame transforms precomputed and delivered via init context.
 
 #### Phase 2 — Health transitions
 
-- [ ] `latency_budget`, `lost_after`, `sync_tolerance`, `recover_after` options on the estimator entity.
-- [ ] `on_degraded`, `on_lost`, `on_recovered` command-name options on the estimator entity; verifier checks the command exists.
-- [ ] Hysteresis-debounced state transitions: `:healthy ⇄ :degraded`, both → `:lost` via GenServer timeout, `:lost → :degraded` on next input.
-- [ ] Configured commands invoked on transitions with `{estimator, reason, source_path, previous_state, new_state}` args.
-- [ ] Telemetry events: `:input`, `:output`, `:latency`, `:dropped`, `:transition`.
+- [x] `latency_budget`, `lost_after`, `sync_tolerance`, `recover_after` options on the estimator entity.
+- [x] `on_degraded`, `on_lost`, `on_recovered` command-name options on the estimator entity; verifier checks the command exists.
+- [x] Hysteresis-debounced state transitions: `:healthy ⇄ :degraded`, both → `:lost` via GenServer timeout, `:lost → :degraded` on next input.
+- [x] Configured commands invoked on transitions with `{estimator, reason, source_path, previous_state, new_state}` args.
+- [x] Telemetry events: `:input`, `:output`, `:latency`, `:dropped`, `:transition`.
 
 #### Phase 3 — Math types and payloads
 
-- [ ] `BB.Math.Covariance3` and `BB.Math.Covariance6` with `new/1`, `diagonal/1`, `from_tensor/1`, `to_tensor/1`.
-- [ ] Optional `*_covariance` fields on `BB.Message.Sensor.Imu`.
-- [ ] `BB.Message.Estimator.Pose` payload.
-- [ ] `BB.Message.Estimator.Odometry` payload.
-- [ ] `BB.Error.Estimator.{StaleInput, SyncMiss, MissingCovariance}` error types.
+- [x] `BB.Math.Covariance3` and `BB.Math.Covariance6` with `new/1`, `diagonal/1`, `from_tensor/1`, `to_tensor/1`.
+- [x] Optional `*_covariance` fields on `BB.Message.Sensor.Imu`.
+- [x] `BB.Message.Estimator.Pose` payload.
+- [x] `BB.Message.Estimator.Odometry` payload.
+- [x] `BB.Error.Estimator.{StaleInput, SyncMiss, MissingCovariance}` error types.
 
 #### Phase 4 — `bb_ahrs` sibling package
 
-- [ ] `bb_ahrs` package created, replacing Gus' `ahrs` library.
-- [ ] `BB.Ahrs.Madgwick`, `BB.Ahrs.Mahony`, `BB.Ahrs.Complementary` implementing `BB.Estimator`.
-- [ ] Algorithms use `BB.Math.Quaternion`/`Vec3` (not their own quaternion type).
-- [ ] Algorithms accept the standard estimator init context (target_frame, transforms).
-- [ ] Linear acceleration rejection (existing `accel_threshold` mechanism preserved).
-- [ ] Test suite: tilt sequences, drift behaviour, accel-outlier rejection, dt sensitivity.
+- [x] `bb_ahrs` package created, replacing Gus' `ahrs` library — named `bb_estimator_ahrs`
+- [x] `BB.Ahrs.Madgwick`, `BB.Ahrs.Mahony`, `BB.Ahrs.Complementary` implementing `BB.Estimator` — namespaced `BB.Estimator.Ahrs.*`
+- [ ] Algorithms use `BB.Math.Quaternion`/`Vec3` (not their own quaternion type) — deliberately not done
+- [x] Algorithms accept the standard estimator init context (target_frame, transforms).
+- [x] Linear acceleration rejection (existing `accel_threshold` mechanism preserved).
+- [x] Test suite: tilt sequences, drift behaviour, accel-outlier rejection, dt sensitivity.
 
 ### Should Have
 
-- [ ] Chaining: estimator-consumes-estimator-output supported by path resolution.
-- [ ] Documentation: README, tutorial covering within-sensor AHRS, tutorial covering cross-sensor fusion, tutorial covering health-via-commands.
-- [ ] `mix.usage_rules` documentation.
+- [x] Chaining: estimator-consumes-estimator-output supported by path resolution.
+- [x] Documentation: README, tutorial covering within-sensor AHRS, tutorial covering cross-sensor fusion, tutorial covering health-via-commands.
+- [x] `mix.usage_rules` documentation.
 
 ### Won't Have (deferred)
 
@@ -766,6 +772,72 @@ The verifier rejects cycles in this graph.
 - [ ] Cross-node estimation.
 - [ ] Replay/batched estimation. The behaviour is online-only in v1.
 - [ ] Hot reload of estimator parameters without restart (parameters can change at runtime via `handle_options/2` if the algorithm implements it).
+
+---
+
+## As shipped
+
+All four phases landed. Phases 1–3 are in `bb` core: the behaviour, the server,
+`BB.Estimator.Context`, the `estimator`/`input`/`output` DSL entities and their
+verifiers, the health options and transitions, all five telemetry events,
+`BB.Math.Covariance3`/`Covariance6`, the covariance fields on
+`BB.Message.Sensor.Imu`, `BB.Message.Estimator.Pose`/`Odometry`, and the three
+`BB.Error.Estimator` types. Phase 4 is `bb_estimator_ahrs` v0.2.0.
+
+The prose and examples in this document, however, use names that were never
+built. The corrections below are the important part of this section.
+
+### Module and package names
+
+| This proposal | What shipped |
+|---|---|
+| `bb_ahrs` (package) | `bb_estimator_ahrs` |
+| `BB.Ahrs.Madgwick` | `BB.Estimator.Ahrs.Madgwick` |
+| `BB.Ahrs.Mahony` | `BB.Estimator.Ahrs.Mahony` |
+| `BB.Ahrs.Complementary` | `BB.Estimator.Ahrs.Complementary` |
+| `BB.Sensor.Bmi232` | `BB.Sensor.BMI323`, from `bb_sensor_bmi323` |
+| `input :key, path, driver: true` | `input :key, path, driver?: true` |
+
+`BB.Sensor.Bmi232` appears eight times in the examples below and is simply a
+typo — there is no such part. The sensor is a Bosch BMI323.
+
+### Names used illustratively that were never implemented
+
+The multi-stage fusion examples read as though these exist. None do, and none
+are planned under this proposal:
+
+- `BB.Fusion.Complementary`, `BB.Fusion.LowPass`, `BB.Fusion.WeightedAverage`
+- `BB.Estimator.Ekf` — explicitly deferred in Won't Have above, but used in a
+  worked example as if available
+- `BB.Ahrs.GravityTilt` — flagged as hypothetical in the surrounding prose
+- `BB.Sensor.Lis3dh`, `BB.Sensor.WheelOdom`
+
+The cross-sensor fusion contract they illustrate is real and the framework
+supports it; there is just no shipped algorithm that uses it. The only
+estimators in the ecosystem today are the three AHRS filters, all of which are
+single-input and sensor-nested. Cross-sensor fusion has not been exercised by a
+real implementation.
+
+### The AHRS algorithms keep their own quaternion type
+
+The phase-4 criterion "algorithms use `BB.Math.Quaternion`/`Vec3` (not their own
+quaternion type)" was dropped on purpose. `BB.Estimator.Ahrs.Quaternion` is a
+plain scalar `{w, x, y, z}` struct, because the filters run at hundreds of Hz
+and Nx dispatch overhead per operation dominates the arithmetic at that rate.
+Conversion to `BB.Math.Quaternion` happens at each estimator's input and output
+boundary, so the published payloads still use the core types — the divergence is
+internal to the algorithms.
+
+Note that `bb_estimator_ahrs` is mixed-licence as a result of the port from
+[gworkman/ahrs](https://github.com/gworkman/ahrs): the algorithm code is MIT,
+the BB wrappers Apache-2.0.
+
+### Relationship to proposal 0017
+
+The Summary states that `BB.Perception.Perceptor` is "restructured as a
+specialisation of `BB.Estimator`". That restructuring is described in 0017,
+which remains accepted-but-unbuilt — no perception package exists. Nothing in
+the shipped estimator contract depends on it.
 
 ---
 

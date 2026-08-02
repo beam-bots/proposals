@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal: bb_teleop
 
-**Status:** Draft
+**Status:** Accepted
 **Author:** James Harton
 **Created:** 2026-01-11
 
