@@ -71,6 +71,32 @@ The two proposals divide cleanly along that line: 0022 is core because forward
 kinematics is core; `bb_geo` is a package because coordinate maths is
 self-contained.
 
+The message payloads follow the maths, for the same reason and one more. It would
+be easy to argue from precedent that they belong in core, since
+`BB.Message.Sensor.Imu`, `LaserScan`, `Range`, `BatteryState`, `PowerState`, and
+`Image` all live there today. But that precedent is weaker than it looks:
+
+| Payload in core | Referenced by core | Referenced by any package |
+|---|---|---|
+| `JointState` | 5 files | yes |
+| `Imu` | docstrings only | `bb_sensor_bmi323` |
+| `PowerState` | no | `bb_sensor_ina219` |
+| `LaserScan` | no | **nothing** |
+| `Range` | no | **nothing** |
+| `BatteryState` | no | **nothing** |
+| `Image` | no | **nothing** |
+
+`JointState` is genuinely load-bearing — transmissions, the actuator command
+pipeline, and `BB.Sensor.publish_joint_state/3` all use it. Everything below it is
+vocabulary core never touches, and four of the seven are used by *nothing in the
+ecosystem at all*: payloads added ahead of drivers that never arrived.
+
+So the direction of travel is core **shedding** driver-facing payloads rather than
+accumulating more. Adding `NavSatFix` to core would be moving against that, and
+`bb_geo` is where a payload that only GNSS drivers publish and only GNSS consumers
+read belongs. Unbundling the existing ones is a separate question, out of scope
+here.
+
 ### Why no behaviour
 
 Worth stating explicitly, because "a common behaviour for GNSS modules" is the
@@ -387,35 +413,23 @@ sensor :gps, {BB.GPSD.Sensor, host: "localhost"}
 
 ## Open Questions
 
-1. **Should the messages live here or in `bb` core?** Arguments both ways. Core
-   precedent is strong — `BB.Message.Sensor.Imu`, `LaserScan`, and `BatteryState`
-   are all in core, and `bb_sensor_bmi323` doesn't depend on a `bb_imu` package to
-   get `Imu`. Messages are vocabulary rather than capability, so a struct in core
-   costs nothing unless something publishes it. Against: every GNSS driver takes
-   the `bb_geo` dependency anyway, so putting them here keeps core leaner.
-
-   The case that tips it is a *surface* rather than a driver: `bb_liveview`
-   wanting to render a fix on a map would need a geodesy dependency purely to
-   pattern-match a message. This proposal assumes `bb_geo`; worth settling in
-   review.
-
-2. **Does a fix-to-floating-joint estimator belong here?** Proposal 0022 makes a
+1. **Does a fix-to-floating-joint estimator belong here?** Proposal 0022 makes a
    floating joint real but leaves it unpopulated. A `BB.Estimator` fusing
    `NavSatFix` with AHRS orientation into a pose is the obvious join between the
    two proposals. It may want its own package, since it depends on both and on
    `bb_estimator_ahrs`.
 
-3. **Which local-frame origin policy?** First-fix, configured constant, and
+2. **Which local-frame origin policy?** First-fix, configured constant, and
    moving-origin are all reasonable. The example above uses first-fix, but a
    robot that reboots mid-mission wants a stable configured origin. Possibly a
    caller concern rather than a library one.
 
-4. **`altitude` naming.** `LLA.altitude` meaning height above the ellipsoid is
+3. **`altitude` naming.** `LLA.altitude` meaning height above the ellipsoid is
    correct but invites misreading, since colloquial "altitude" means above sea
    level. `height` — which is what `bb_ublox`'s `NavSatFix` calls it — may be
    clearer despite being less standard for the acronym.
 
-5. **Should `bb_geo` be usable without `bb`?** The conversions are independent of
+4. **Should `bb_geo` be usable without `bb`?** The conversions are independent of
    the framework; only the messages need `BB.Message`. Splitting a dependency-free
    `geo` library from `bb_geo` is possible but is speculative generality unless
    someone actually wants it.
