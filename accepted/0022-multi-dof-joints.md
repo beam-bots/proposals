@@ -216,12 +216,79 @@ affected differently, and the difference is worth stating plainly:
   configuration API rather than the scalar one.
 - **`bb_ik_fabrik`** — FABRIK is not Jacobian-based. It is a heuristic that
   iteratively repositions joints along a chain, and a 6-DoF floating base has no
-  meaningful interpretation in that scheme. FABRIK should **detect a multi-DoF
-  joint in the chain and return a clear error**, not silently mis-solve. Adding
-  that check is part of this proposal's acceptance criteria.
+  meaningful interpretation in that scheme. FABRIK must not silently mis-solve.
 
 This asymmetry is a genuine capability difference between the two solvers and
-should be documented in both packages rather than papered over.
+should be surfaced rather than papered over.
+
+#### Declaring solver capability
+
+The mechanism matters here, because the obvious one doesn't reach. A solver
+cannot inspect a robot's DSL state at compile time: `BB.IK.Solver`
+implementations are **not declared in the DSL at all** — there is no mention of
+solvers anywhere in `BB.Dsl`. A solver is chosen per call, as
+`BB.Motion.move_to(Robot, link, target, solver: BB.IK.FABRIK)`. So an
+`@after_verify` hook in `bb_ik_fabrik` has no robot to look at, and one on the
+robot module has no idea which solver will be used.
+
+The minimum that makes any check possible is a capability declaration on the
+behaviour itself:
+
+```elixir
+defmodule BB.IK.Solver do
+  @doc """
+  The joint types this solver can handle.
+
+  Optional. A solver that doesn't implement it is assumed to support the
+  single-DoF types only, so an existing or third-party solver that never
+  contemplated multi-DoF joints reports the truth without being edited.
+  """
+  @callback supported_joint_types() :: [atom()]
+
+  @optional_callbacks supported_joint_types: 0
+end
+```
+
+```elixir
+# bb_ik_fabrik
+def supported_joint_types, do: [:fixed, :revolute, :continuous, :prismatic]
+
+# bb_ik_dls
+def supported_joint_types,
+  do: [:fixed, :revolute, :continuous, :prismatic, :planar, :floating]
+```
+
+`BB.Motion` checks the chain's joint types against the solver's declared support
+once per call and refuses rather than mis-solving. The permissive default is the
+important part: a solver that predates this proposal gets a clear refusal instead
+of a wrong answer, with no change to its code.
+
+**Compile-time would be better, and this is the path to it.** `@after_verify` is
+already an established pattern in `bb` — `BB.Error` uses
+`@after_verify {BB.Error, :__verify_severity_impl__}`, and
+`validate_child_spec_behaviours_transformer.ex` notes that verifiers run there.
+For a solver check to run at compile time, the robot has to know which solver it
+uses, which means **declaring solvers in the DSL**:
+
+```elixir
+settings do
+  ik_solver {BB.IK.DLS, max_iterations: 100}
+end
+```
+
+A Spark verifier could then compare `supported_joint_types/0` against the
+topology's joint types and warn or fail during compilation, using exactly the
+same callback this proposal adds.
+
+That change is worth making on its own merits, independently of multi-DoF joints.
+Solver options are currently an untyped keyword list with no schema or
+validation, and `bb_ik_dls` and `bb_ik_fabrik` already disagree on their
+`max_iterations` defaults — 100 against 50 — with nothing to reconcile them.
+Declaring solvers in the DSL would subject them to the same option validation
+every other component already gets.
+
+It is out of scope here. This proposal adds the callback and the call-time check,
+which is what correctness requires; see Open Questions.
 
 ### Message payloads
 
@@ -358,9 +425,12 @@ positions = BB.Robot.State.get_all_positions(state)
       `defn` kernel expects
 - [ ] Jacobian width is the sum of DoF along the chain; a floating joint
       contributes three translation and three rotation columns
-- [ ] `bb_ik_fabrik` returns a clear error when a chain contains a multi-DoF
-      joint, rather than silently producing a wrong solution
-- [ ] `bb_ik_dls` solves chains containing multi-DoF joints
+- [ ] `BB.IK.Solver` gains an optional `supported_joint_types/0` callback,
+      defaulting to the single-DoF types when unimplemented
+- [ ] `BB.Motion` refuses a solve whose chain contains a joint type the chosen
+      solver doesn't declare support for, rather than mis-solving
+- [ ] `bb_ik_fabrik` declares single-DoF support only
+- [ ] `bb_ik_dls` declares multi-DoF support and solves such chains
 - [ ] `BB.Message.Sensor.JointState` documents that it describes single-DoF
       joints only
 - [ ] Round-trip tests: a configuration set, then read back through FK, produces
@@ -371,6 +441,8 @@ positions = BB.Robot.State.get_all_positions(state)
 
 - [ ] A compile-time verifier rejecting `axis` on a `:floating` joint, and
       requiring it on `:planar`
+- [ ] `BB.Motion` logs a warning at the first refused solve naming the offending
+      joint and its type, so the cause is obvious without reading a stacktrace
 - [ ] Velocity/twist representation for multi-DoF joints
 - [ ] `BB.Robot.Topology` path helpers aware of per-joint DoF
 
@@ -383,6 +455,8 @@ positions = BB.Robot.State.get_all_positions(state)
 - [ ] Non-holonomic constraints — a `:planar` joint is fully holonomic in this
       proposal, so declaring one does not stop a solver commanding sideways
       motion a differential-drive base can't achieve
+- [ ] Declaring IK solvers in the DSL, which is what compile-time solver
+      verification needs; see Open Questions
 
 ---
 
@@ -414,6 +488,20 @@ positions = BB.Robot.State.get_all_positions(state)
 6. **Root link semantics.** With a floating joint, is the root link still the
    kinematic root, or is it a reference frame the robot moves *within*? This
    proposal doesn't need an answer, but the follow-up frame proposal will.
+
+7. **Should IK solvers be DSL-declared, so the check can move to compile time?**
+   `supported_joint_types/0` gives a correct call-time refusal, but a wrong
+   solver choice is a *configuration* error and configuration errors are better
+   caught during compilation. Declaring the solver in `settings` would let a
+   Spark verifier compare the callback against the topology, and would
+   incidentally bring solver options under the same validation as every other
+   component's — currently they're an unschema'd keyword list whose defaults two
+   solvers already disagree on. Probably its own proposal.
+
+8. **Whether refusal should be an error or a warning.** A hard error is safer,
+   but it would break any existing caller that passes FABRIK for a chain
+   containing a joint type it never supported — though such a caller is getting
+   wrong answers today, so "break" may be the wrong word.
 
 ---
 
