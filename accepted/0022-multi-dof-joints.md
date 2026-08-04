@@ -363,13 +363,18 @@ So this proposal changes the callback to take both ends:
           ) :: solve_result()
 ```
 
-Solver implementations must handle both. Callers get a default: `BB.Motion`'s
-`move_to/4`, `move_to_multi/4`, and the `solve_only*` functions default
-`source_link` to the robot's root link, so every existing call site behaves
-identically. The two per-package convenience modules (`BB.IK.DLS.Motion`,
-`BB.IK.FABRIK.Motion`) do the same.
+`solve/5` is **removed**, not retained as a defaulting clause, and `source_link`
+has **no default** anywhere — including in `BB.Motion`, where `:source_link`
+becomes a required option alongside the already-required `:solver`.
 
-This also makes the walking robot expressible with the solvers that exist:
+Defaulting it to the root was tempting and is wrong. The root is the correct
+source for a fixed-base arm and precisely the *wrong* one for a robot whose base
+floats, where it silently yields the contaminated chain. A default that is right
+for one class of robot and quietly wrong for another is the footgun this change
+exists to remove — and it would hide the breakage rather than surface it, which
+defeats the point of breaking the callback at all.
+
+Every solve therefore states its own scope:
 
 ```elixir
 # The chain contains only revolute joints, so FABRIK is a fine choice —
@@ -380,6 +385,35 @@ BB.Motion.move_to(robot, :front_left_foot, target,
 )
 ```
 
+##### `BB.Robot.root_link/1`
+
+Requiring the source shifts a small burden onto callers that genuinely do want
+root-to-target, which is most arm commands. `bb` already exposes `root_link` as a
+field on the `BB.Robot` struct but has no accessor for it, while every neighbouring
+piece of topology introspection does — `get_link/2`, `get_joint/2`,
+`parent_joint/2`, `child_joints/2`, `path_to/2`, `links_in_order/1`,
+`joints_in_order/1`.
+
+So add one, alongside the others:
+
+```elixir
+@spec root_link(t()) :: atom()
+def root_link(%__MODULE__{root_link: root_link}), do: root_link
+```
+
+A command that wants the whole tree then says so explicitly:
+
+```elixir
+BB.Motion.move_to(robot, :gripper, target,
+  source_link: BB.Robot.root_link(robot),
+  solver: BB.IK.DLS
+)
+```
+
+Marginally more verbose than a default, and the verbosity is the feature: the
+call now records which chain was intended, so a reader can tell whether
+root-to-target was a decision or an accident.
+
 ##### A new topology operation
 
 `BB.Robot.Topology` currently offers only `path_to/2`, root-relative and served
@@ -387,6 +421,9 @@ from a precomputed `paths` map. A source link needs a path *between* two links:
 
 ```elixir
 BB.Robot.Topology.path_between(topology, source_link, target_link)
+
+# Delegated from BB.Robot, as path_to/2 already is.
+BB.Robot.path_between(robot, source_link, target_link)
 ```
 
 Restricted to the case where **`source_link` is an ancestor of `target_link`**,
@@ -448,11 +485,14 @@ Stated plainly, since it's the cost of not papering over this:
 |---|---|---|
 | State API rename and retype | 21 | `bb`, `bb_ik_dls`, `bb_ik_fabrik`, `bb_policy`, `bb_example_so101` |
 | `BB.IK.Solver.solve/5` → `solve/6` | 3 in `BB.Motion`, plus both solvers | `bb`, `bb_ik_dls`, `bb_ik_fabrik` |
+| `:source_link` required by `BB.Motion` | ~47, many in doc examples | `bb`, `bb_ik_dls`, `bb_ik_fabrik`, `bb_example_so101`, `bb_example_wx200` |
 | `JointState` value types | 24 files | `bb`, `bb_kino`, `bb_liveview`, `bb_pid_controller`, `bb_jido`, `bb_mcp`, all four `bb_servo_*` |
 
 The `JointState` change is the widest, and most of those consumers only ever see
 single-DoF joints, so in practice their handling is unchanged — but their type
-specs and any exhaustive pattern matches need review. `bb` being pre-1.0 is what
+specs and any exhaustive pattern matches need review. The `:source_link`
+requirement is the most numerous but the most mechanical: each call site gains
+either an explicit link name or `source_link: BB.Robot.root_link(robot)`. `bb` being pre-1.0 is what
 makes this affordable; it will not be later, which is an argument for doing it now
 rather than after more consumers exist.
 
@@ -531,6 +571,26 @@ Something — an odometry estimator, out of scope here — drives the joint:
 BB.Robot.State.set_configuration(state, :base, {12.4, -3.1, 1.57})
 ```
 
+Solving for the sensor head means choosing whether the base is part of the
+problem, and the call now has to say which:
+
+```elixir
+# Aim the head by rotating the mast only. The base is not part of this.
+BB.Motion.move_to(robot, :sensor_head, target,
+  source_link: :chassis,
+  solver: BB.IK.FABRIK
+)
+
+# Reach the target by driving *and* rotating the mast, in one solve.
+BB.Motion.move_to(robot, :sensor_head, target,
+  source_link: BB.Robot.root_link(robot),
+  solver: BB.IK.DLS
+)
+```
+
+Those are genuinely different problems, and before this change only the second was
+expressible — while being the one `bb_ik_fabrik` cannot solve.
+
 A drone, where the base is fully free:
 
 ```elixir
@@ -591,17 +651,19 @@ changes. That is the whole migration for an arm.
       the table
 - [ ] `set_configuration/3` writes a whole configuration; there is no partial
       update API
-- [ ] `BB.IK.Solver.solve/5` becomes `solve/6`, taking `source_link` ahead of
-      `target_link`
+- [ ] `BB.IK.Solver.solve/6` takes `source_link` ahead of `target_link`, and
+      `solve/5` is **removed** rather than kept as a defaulting clause
 - [ ] `BB.Robot.Topology.path_between/3`, restricted to a source that is an
-      ancestor of the target, erroring otherwise
+      ancestor of the target, erroring otherwise, delegated from
+      `BB.Robot.path_between/3`
+- [ ] `BB.Robot.root_link/1` accessor, alongside the existing topology
+      introspection functions
 - [ ] `BB.Motion.move_to/4`, `move_to_multi/4`, and the `solve_only*` functions
-      accept `source_link`, defaulting to the robot's root link, so every existing
-      call site behaves identically
+      require `:source_link`, with no default, as they already require `:solver`
 - [ ] `bb_ik_dls` and `bb_ik_fabrik` implement `solve/6` and derive their chain
       from `path_between/3` rather than `path_to/2`
-- [ ] `BB.IK.DLS.Motion` and `BB.IK.FABRIK.Motion` accept and default
-      `source_link` the same way
+- [ ] `BB.IK.DLS.Motion` and `BB.IK.FABRIK.Motion` require `:source_link` the
+      same way
 - [ ] `bb_ik_dls` solves chains containing multi-DoF joints
 - [ ] A solve scoped `source_link: :body` on a floating-base robot produces a
       chain containing no multi-DoF joint, and `bb_ik_fabrik` handles it
@@ -668,20 +730,11 @@ changes. That is the whole migration for an arm.
    with floating joints but lets a producer emit a physically impossible
    out-of-plane value. Minor either way.
 
-5. **Should `source_link` be positional or an option?** This proposal makes it
-   positional in the callback, so implementations cannot ignore it, while callers
-   get a defaulted `:source_link` option through `BB.Motion`. The alternative —
-   threading it through `opts` everywhere — is less disruptive to solver
-   implementations but lets one silently ignore it, which is the failure mode the
-   change exists to prevent.
-
-6. **Should `source_link` default at all?** Defaulting to the root was agreed for
-   convenience, but given the willingness to break things it is worth asking. The
-   root is the correct source for a fixed-base arm and the *wrong* one for a
-   floating-base robot, where it silently produces the contaminated chain — so the
-   default is simultaneously the ergonomic choice and the footgun. Requiring it
-   explicitly would make every solve state its scope, at the cost of noise in the
-   overwhelmingly common arm case.
+5. **Should `path_between/3` return an error or raise on a non-ancestor source?**
+   Every other topology lookup returns `nil` for a miss (`get_link/2`,
+   `path_to/2`), which argues for consistency — but a non-ancestor source is a
+   programming error rather than a lookup miss, and returning `nil` would let it
+   surface later as a confusingly empty chain.
 
 ---
 
