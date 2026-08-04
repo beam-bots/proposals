@@ -493,12 +493,74 @@ With two link parameters, reporting an unknown *source* as `target_link` is
 actively misleading. The field becomes `:link` with a new `:role` of `:source` or
 `:target`, which is a breaking change to an error struct across its nine usages.
 
-##### `path_to/2` should change too
+##### Every nil-returning lookup converts
 
-The same argument applies to `path_to/2`, and leaving it returning `nil` while its
-sibling returns structured errors is a worse inconsistency than either choice
-alone. Changing it to `{:ok, path} | {:error, UnknownLink.t()}` also deletes the
-duplicated translation from both solvers. Five call sites.
+The same argument applies beyond `path_to/2`. A function returning `nil` forces
+every caller to invent a diagnosis, and a caller that forgets propagates the `nil`
+into arithmetic to fail somewhere unrelated. So the whole introspection surface
+moves to result tuples.
+
+The line is drawn on **what the `nil` means**, not on which module the function
+lives in:
+
+- `nil` meaning *"you asked for something that does not exist"* → becomes
+  `{:error, BB.Error.t()}`. The caller made a mistake and deserves to be told
+  which one.
+- `nil` meaning *"this thing legitimately has no value"* → stays `nil`. There is
+  nothing to diagnose.
+
+**Converting:**
+
+| Function | Was | Becomes |
+|---|---|---|
+| `BB.Robot.get_link/2` | `Link.t() \| nil` | `{:ok, Link.t()} \| {:error, UnknownLink.t()}` |
+| `BB.Robot.get_joint/2` | `Joint.t() \| nil` | `{:ok, Joint.t()} \| {:error, UnknownJoint.t()}` |
+| `BB.Robot.parent_joint/2` | `Joint.t() \| nil` | `{:ok, Joint.t()} \| {:error, UnknownLink.t() \| NoParentJoint.t()}` |
+| `BB.Robot.path_to/2` | `[atom()] \| nil` | `{:ok, [atom()]} \| {:error, UnknownLink.t()}` |
+| `BB.Robot.actuator_path/2` | `[atom()] \| nil` | `{:ok, [atom()]} \| {:error, UnknownActuator.t()}` |
+| `BB.Robot.Topology.path_to/2` | `[atom()] \| nil` | as `BB.Robot.path_to/2` |
+| `BB.Robot.Topology.depth_of/2` | `non_neg_integer() \| nil` | `{:ok, non_neg_integer()} \| {:error, UnknownLink.t()}` |
+| `BB.Robot.State.get_joint_position/2` | `float() \| nil` | `{:ok, configuration} \| {:error, UnknownJoint.t()}` |
+| `BB.Robot.State.get_joint_velocity/2` | `float() \| nil` | `{:ok, velocity} \| {:error, UnknownJoint.t()}` |
+
+The last two are renamed to `get_configuration/2` and `get_velocity/2` under this
+proposal anyway, so they are already being touched.
+
+**Staying `nil`, deliberately:**
+
+| Function | Why |
+|---|---|
+| `BB.Loop.tick/1`, `observe/2` | `dt` is `nil` on the first tick *by design* — `BB.Loop`'s own docs say "there is no valid interval here" and instruct callers to match on it and skip the step. Converting this would turn a documented, correct absence into a spurious error every time a loop starts. |
+| `BB.Transmission.Resolver.resolve/3` | `nil` means "this component has no transmission", which is the normal case for most components. `BB.Sensor.to_joint_space/3` relies on it to pass a message through unchanged. |
+| `BB.Robot.Units.to_*_or_nil/1` | Absence-preserving conversions over optional DSL fields; the name is the contract. |
+| `BB.Transmission.apply_to_command/2`, `unapply_to_payload/2` | Take `t() \| nil` as *input*, meaning "no transmission". Not a lookup. |
+| `BB.Actuator.MotorProfile.from_joint/2` | Same — accepts optional inputs, returns a struct. |
+
+##### New error types
+
+Only `UnknownLink` exists today. Three more are needed, all class `:kinematics`
+alongside it — note that `BB.Error.Invalid.Topology` is DSL-compilation-time
+validation, so runtime lookup failures do not belong there:
+
+- `BB.Error.Kinematics.UnknownJoint` — `fields: [:joint, :robot]`
+- `BB.Error.Kinematics.UnknownActuator` — `fields: [:actuator, :robot]`
+- `BB.Error.Kinematics.NoParentJoint` — `fields: [:link]`
+
+`NoParentJoint` earns its own type rather than folding into `UnknownLink` because
+the root link having no parent joint is a **true structural fact**, not a typo.
+Collapsing the two would tell a caller walking up the tree that its perfectly
+valid root link "doesn't exist". Keeping them distinct gives such a caller a
+termination signal it can match on:
+
+```elixir
+defp ancestors(robot, link, acc) do
+  case BB.Robot.parent_joint(robot, link) do
+    {:ok, joint} -> ancestors(robot, joint.parent_link, [joint | acc])
+    {:error, %NoParentJoint{}} -> {:ok, acc}
+    {:error, reason} -> {:error, reason}
+  end
+end
+```
 
 The general case, where the two links share only a common ancestor, requires
 traversing *up* the tree from the source before descending to the target, which
@@ -556,7 +618,7 @@ Stated plainly, since it's the cost of not papering over this:
 | `BB.IK.Solver.solve/5` → `solve/6` | 3 in `BB.Motion`, plus both solvers | `bb`, `bb_ik_dls`, `bb_ik_fabrik` |
 | `:source_link` required by `BB.Motion` | ~47, many in doc examples | `bb`, `bb_ik_dls`, `bb_ik_fabrik`, `bb_example_so101`, `bb_example_wx200` |
 | `JointState` value types | 24 files | `bb`, `bb_kino`, `bb_liveview`, `bb_pid_controller`, `bb_jido`, `bb_mcp`, all four `bb_servo_*` |
-| `path_to/2` returns a result tuple | 5 | `bb`, `bb_ik_dls`, `bb_ik_fabrik` |
+| Introspection lookups return result tuples | ~23 | `bb`, `bb_ik_dls`, `bb_ik_fabrik` |
 | `UnknownLink` field rename | 9 | `bb`, `bb_ik_dls`, `bb_ik_fabrik` |
 
 The `JointState` change is the widest, and most of those consumers only ever see
@@ -732,8 +794,17 @@ changes. That is the whole migration for an arm.
       the message names the link the caller should have passed
 - [ ] `BB.Error.Kinematics.UnknownLink` gains `:role` and its `:target_link` field
       becomes `:link`, so an unknown source isn't reported as a target
-- [ ] `path_to/2` returns `{:ok, path} | {:error, UnknownLink.t()}` rather than
-      `nil`, and the duplicated translation is deleted from both solvers
+- [ ] Every introspection lookup whose `nil` meant "does not exist" returns a
+      result tuple: `get_link/2`, `get_joint/2`, `parent_joint/2`, `path_to/2`,
+      `actuator_path/2`, `Topology.path_to/2`, `Topology.depth_of/2`, and the
+      state accessors — and the duplicated nil-translation is deleted from both
+      solvers
+- [ ] `nil` is *retained* where it means "legitimately has no value": `BB.Loop`'s
+      `dt`, `Transmission.Resolver.resolve/3`, and the `Units.to_*_or_nil/1`
+      family
+- [ ] `BB.Error.Kinematics.UnknownJoint`, `UnknownActuator`, and `NoParentJoint`,
+      with `NoParentJoint` distinct from `UnknownLink` so a caller walking up the
+      tree gets a termination signal rather than a bogus "link doesn't exist"
 - [ ] `set_configuration/3` reports `BB.Error.Invalid.JointConfig` on a shape
       mismatch, populating `:expected`
 - [ ] `BB.Robot.root_link/1` accessor, alongside the existing topology
@@ -810,14 +881,12 @@ changes. That is the whole migration for an arm.
    with floating joints but lets a producer emit a physically impossible
    out-of-plane value. Minor either way.
 
-5. **How far should the `nil`-to-structured-error change reach?** This proposal
-   converts `path_to/2` alongside `path_between/3`, since leaving siblings
-   inconsistent is worse than either choice. But `get_link/2`, `get_joint/2`,
-   `parent_joint/2`, and `actuator_path/2` all still return `nil`. Converting them
-   too would be consistent and is a larger, purely mechanical change; converting
-   none of them leaves the same wart elsewhere. Arguably these are genuine
-   *lookups* where `nil` is a reasonable answer, whereas a path is a computation
-   whose failure has a diagnosable cause — but that line is thin.
+5. **Should `parent_joint/2`'s root case be an error at all?** The proposal returns
+   `{:error, %NoParentJoint{}}`, which is matchable and explicit. The alternative is
+   a third success shape — `{:ok, joint} | :root` — which arguably models "the root
+   has no parent" more honestly, since it is not a failure. Against it: callers then
+   have three shapes rather than two, and `:root` is easy to forget in a `case`
+   where an unmatched `{:error, _}` at least crashes loudly.
 
 ---
 
