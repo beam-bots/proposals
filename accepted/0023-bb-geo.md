@@ -285,8 +285,10 @@ iteration poorly, because the loop count has to be static to compile and
 vectorise.
 
 - **`lla_to_ecef/1`** is closed-form. `defn`.
-- **`ecef_to_lla/2`** is Bowring's method, which converges to sub-millimetre in a
-  *fixed* one or two iterations and so unrolls cleanly. `defn`.
+- **`ecef_to_lla/2`** has no exact closed form for latitude, so it uses Bowring's
+  method. A single iteration is accurate to roughly a micrometre on the ellipsoid,
+  so implementations run a *fixed* one or two passes rather than looping to
+  convergence — which makes it straight-line arithmetic, not a loop. `defn`.
 - **Local frame conversions** are a subtraction and a matrix multiply. `defn`,
   and the batching benefit is real here since converting a whole track is one
   call.
@@ -508,6 +510,11 @@ sensor :gps, {BB.GPSD.Sensor, host: "localhost"}
       values rather than only round-tripped
 - [ ] `Nx.Defn.grad/1` produces correct Jacobians for the transforms, checked
       against finite differences of the forward function
+- [ ] Those Jacobians are **finite and correct across the operating envelope,
+      including near-polar latitudes**. `ecef_to_lla/2` is built from `atan2` and
+      `sqrt`, which are singular at the poles and at the geocentre; a gradient that
+      goes `NaN` rather than merely large would fill a downstream filter with `NaN`
+      and give no indication why
 - [ ] `BB.Geo.LocalFrame` supporting both `:enu` and `:ned`, with no default
 - [ ] `to_local/2` and `from_local/2` round-tripping to sub-millimetre
 - [ ] Haversine and ellipsoidal distance, initial and final bearing, the latter
@@ -553,12 +560,6 @@ sensor :gps, {BB.GPSD.Sensor, host: "localhost"}
    both Vincenty and Karney. It matters: Vincenty fails to converge for
    near-antipodal points and Karney does not, which is exactly the case a
    cross-check should exercise. Determine before relying on it as a reference.
-
-2. **Does `Nx.Defn.grad/1` differentiate cleanly through the unrolled Bowring
-   iteration?** The differentiability argument for `defn` assumes so. Bowring is a
-   fixed small number of iterations with no data-dependent branching, so it should,
-   but the claim should be tested rather than asserted — it is load-bearing for the
-   whole Nx decision.
 
 ---
 
