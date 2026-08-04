@@ -19,8 +19,8 @@ SPDX-License-Identifier: Apache-2.0
 return `Transform.identity()` from forward kinematics. This proposal implements
 them properly, which means teaching the kinematics and state layers that a joint
 can carry more than one degree of freedom. A `:floating` joint's configuration
-becomes a `BB.Math.Transform`, a `:planar` joint's becomes `{x, y, θ}` in the
-plane defined by its `axis`, and both contribute their full complement of columns
+becomes a `BB.Math.Transform`, a `:planar` joint's becomes a new
+`BB.Math.Transform2D`, and both contribute their full complement of columns
 to the Jacobian. The state API and `BB.Message.Sensor.JointState` are changed
 rather than supplemented — `bb` is pre-1.0, and a parallel scalar-only API kept
 for compatibility would be a permanent translation cost paid to avoid a one-off
@@ -137,12 +137,61 @@ were stubbed in the first place — it is an IK-facing change, not just an FK on
 | `:revolute` | 1 | angle | yes (rotation axis) |
 | `:continuous` | 1 | angle | yes (rotation axis) |
 | `:prismatic` | 1 | displacement | yes (translation axis) |
-| `:planar` | 3 | `{x, y, θ}` | yes (**surface normal**) |
+| `:planar` | 3 | `BB.Math.Transform2D` | yes (**surface normal**) |
 | `:floating` | 6 | `BB.Math.Transform` | no |
 
 `:planar` already uses `axis` as its surface normal per the existing DSL
 documentation (`lib/bb/dsl.ex:506`), so the plane is already expressible and no
 DSL change is needed for it.
+
+#### `BB.Math.Transform2D`
+
+A planar configuration is currently written `{x, y, θ}` in this document's earlier
+drafts, but a bare tuple is the wrong shape for it. Nothing distinguishes it from
+any other three-tuple, its field order is invisible at the call site, and it can be
+handed to a floating joint without complaint. Every other quantity in `BB.Math` is
+a struct — `Vec3`, `Quaternion`, `Transform`, `Covariance3`, `Covariance6` — and
+this should be too:
+
+```elixir
+defmodule BB.Math.Transform2D do
+  @moduledoc "A rigid transform within a plane: translation and rotation about the plane's normal."
+
+  defstruct [:x, :y, :theta]
+
+  @type t :: %__MODULE__{x: float(), y: float(), theta: float()}
+
+  @spec new(number(), number(), number()) :: t()
+  @spec identity() :: t()
+  @spec compose(t(), t()) :: t()
+  @spec inverse(t()) :: t()
+
+  @doc "Lift into 3D, given the normal of the plane the transform is in."
+  @spec to_transform(t(), Vec3.t()) :: Transform.t()
+end
+```
+
+**Unlike its 3D sibling it is not tensor-backed, and that is deliberate.**
+`BB.Math.Transform` holds a 4×4 matrix because it composes through kinematic
+chains by matrix multiply. A planar configuration doesn't need to: it gets lifted
+into a `Transform` for FK anyway, composed with the joint's origin. Storing three
+plain f64 fields instead of a 3×3 matrix means:
+
+- **24 bytes, exactly, with no possible drift.** `theta` is stored as an angle
+  rather than as the `sin`/`cos` entries of a rotation matrix, so there is no
+  orthonormality to lose and no renormalisation on read. This is the same
+  lossless-storage concern as the floating joint's 4×4, but the parameterisation
+  avoids it outright rather than working around it.
+- No backend question. There is no tensor, so nothing backend-specific reaches ETS.
+
+`to_transform/2` takes the plane's normal rather than the struct carrying it. The
+joint already knows its `axis`, and duplicating it into every configuration value
+would let the two disagree.
+
+The same reasoning gives `Twist2D` (`vx`, `vy`, `omega`) and `Wrench2D` (`fx`,
+`fy`, `tau`) for a planar joint's velocity and effort. Using the 3D `Twist`/`Wrench`
+with out-of-plane components zeroed would let a producer emit a physically
+impossible out-of-plane value that nothing would reject.
 
 #### When `:planar` is the right model
 
@@ -208,7 +257,7 @@ angles as the storage representation would be a step backwards.
 **Option C — typed configuration, expanded only for the kernel. Recommended.**
 
 Store each joint's configuration in the shape appropriate to its type — a float
-for single-DoF joints, `{x, y, θ}` for planar, a `Transform` for floating — and
+for single-DoF joints, a `Transform2D` for planar, a `Transform` for floating — and
 expand to the vectorised scalar form *only* inside `chain_tensors/3`, where the
 tensors handed to `defn` are built.
 
@@ -263,8 +312,7 @@ looked at.
 three-tuple aimed at a revolute joint is an error rather than a wrong pose. It
 reports `BB.Error.Invalid.JointConfig`, which already exists with
 `fields: [:joint, :field, :value, :expected, :message]` and fits without
-modification — `joint: :base, field: :configuration, value: 0.5,
-expected: "a {x, y, θ} tuple"`.
+modification — `joint: :base, field: :configuration, value: 0.5, expected: BB.Math.Transform2D`.
 
 **Writes are whole-configuration and atomic.** There is no API for setting part
 of a floating joint — no "just the yaw". A partial-update API invites
@@ -603,7 +651,7 @@ So `JointState` changes to carry type-appropriate values, matching the state API
 | Joint type | `positions` | `velocities` | `efforts` |
 |---|---|---|---|
 | single-DoF | `float` | `float` | `float` |
-| `:planar` | `{x, y, θ}` | `{vx, vy, ω}` | `{fx, fy, τ}` |
+| `:planar` | `Transform2D` | `Twist2D` | `Wrench2D` |
 | `:floating` | `Transform` | `Twist` | `Wrench` |
 
 `BB.Message.Geometry.Twist` (linear and angular `Vec3`) and
@@ -773,9 +821,11 @@ changes. That is the whole migration for an arm.
 ### Must Have
 
 - [ ] `compute_joint_transform/3` returns the correct transform for `:planar`,
-      composing `{x, y, θ}` in the plane defined by `axis`
+      composing a `Transform2D` in the plane defined by `axis`
 - [ ] `compute_joint_transform/3` returns the correct transform for `:floating`
       from a stored `BB.Math.Transform`
+- [ ] `BB.Math.Transform2D`, plus `Twist2D` and `Wrench2D`, as plain-float structs
+      rather than tensor-backed, with `to_transform/2` taking the plane's normal
 - [ ] `BB.Robot.State` stores multi-DoF configurations, with
       `get_configuration/2`, `set_configuration/3`, `get_all_configurations/1`,
       `set_configurations/2`, `get_chain_configurations/2`
@@ -832,9 +882,24 @@ changes. That is the whole migration for an arm.
       `BB.Message.Geometry.Twist` and `Wrench` for floating joints
 - [ ] Every `JointState` consumer across the ecosystem is migrated, not just the
       ones that will see multi-DoF joints
-- [ ] Round-trip tests: a configuration set, then read back through FK, produces
-      the expected pose for both new types
-- [ ] Regression tests proving fixed-base arm kinematics are unchanged
+- [ ] Regression tests proving fixed-base arm kinematics are numerically unchanged
+- [ ] **FK correctness checked against independently derived poses**, not
+      round-tripped through our own code. A round-trip is self-consistent: a
+      systematically wrong transform composition passes it perfectly. Expected
+      poses come from hand-computed cases and from cross-checking at least one
+      non-trivial chain against a known-good external implementation
+- [ ] **Jacobian verified against finite differences of FK.** Numerically
+      differentiating FK gives an independent derivation of the Jacobian, so
+      comparing it against the analytic one catches column-ordering, sign, and
+      per-DoF-width errors. Note this validates the Jacobian *given* FK, which is
+      why FK needs its own independent check above
+- [ ] Composition-order tests: a chain where a floating base and a revolute joint
+      compose non-commutatively, so swapping the order is detectable rather than
+      coincidentally equal
+- [ ] `:planar` tests with a non-Z surface normal, proving `axis` is actually
+      respected rather than the plane being assumed to be XY
+- [ ] `Transform2D` and `Transform` agree: lifting a `Transform2D` via
+      `to_transform/2` and composing matches applying the planar motion directly
 
 ### Should Have
 
@@ -868,29 +933,24 @@ changes. That is the whole migration for an arm.
 
 ## Open Questions
 
-1. **Root link semantics.** With a floating joint, is the root link still the
-   kinematic root, or a reference frame the robot moves *within*? A legged robot
-   solved as body-to-foot chains suggests "the root" and "the base a solver works
-   from" are different concepts that currently share a name. Adding `source_link`
-   makes the distinction expressible without settling what the root *means*, which
-   the follow-up frame proposal will have to.
-
-2. **How much of `defn.ex` has to change.** As much as is necessary. The expansion
+1. **How much of `defn.ex` has to change.** As much as is necessary. The expansion
    may fit entirely in `chain_tensors/3`, or the kernel may need additional masks.
    This affects effort estimation rather than the design, so it wants a spike.
 
-3. **Which frame the floating Jacobian columns are expressed in.** Body frame and
+2. **Which frame the floating Jacobian columns are expressed in.** Body frame and
    world frame are both defensible, and the choice changes what an IK solver's
    delta means. Should follow whatever makes `bb_ik_dls` correct with the least
-   special-casing, and interacts with question 1.
+   special-casing.
 
-4. **A planar joint's velocity and effort shape.** The proposal uses `{vx, vy, ω}`
-   and `{fx, fy, τ}` to match the configuration's `{x, y, θ}`. The alternative is
-   `Twist`/`Wrench` with the out-of-plane components zero, which is more uniform
-   with floating joints but lets a producer emit a physically impossible
-   out-of-plane value. Minor either way.
+3. **Naming: `Transform2D` or `Pose2D`?** `Transform` is this codebase's
+   established name for a rigid transform, so `Transform2D` is the consistent
+   choice and signals the planar sibling. `Pose2D` is the more common domain term
+   but risks confusion with the existing `BB.Message.Geometry.Pose` and
+   `BB.Message.Estimator.Pose`. Existing `BB.Math` names use bare numeric suffixes
+   (`Covariance3`, `Covariance6`), which would argue for `Transform2` — but that
+   reads as "the second transform" rather than "the 2D one".
 
-5. **Should `parent_joint/2`'s root case be an error at all?** The proposal returns
+4. **Should `parent_joint/2`'s root case be an error at all?** The proposal returns
    `{:error, %NoParentJoint{}}`, which is matchable and explicit. The alternative is
    a third success shape — `{:ok, joint} | :root` — which arguably models "the root
    has no parent" more honestly, since it is not a failure. Against it: callers then
