@@ -21,8 +21,10 @@ them properly, which means teaching the kinematics and state layers that a joint
 can carry more than one degree of freedom. A `:floating` joint's configuration
 becomes a `BB.Math.Transform`, a `:planar` joint's becomes `{x, y, θ}` in the
 plane defined by its `axis`, and both contribute their full complement of columns
-to the Jacobian. The scalar `positions` API that every existing single-DoF joint
-uses is left intact and additive functions are introduced alongside it.
+to the Jacobian. The state API and `BB.Message.Sensor.JointState` are changed
+rather than supplemented — `bb` is pre-1.0, and a parallel scalar-only API kept
+for compatibility would be a permanent translation cost paid to avoid a one-off
+migration.
 
 This is deliberately scoped to *finishing two joint types core already declares*.
 It says nothing about world frames, earth frames, odometry sources, or geodesy.
@@ -91,8 +93,9 @@ package can make forward kinematics respect a non-fixed root, because forward
 kinematics is core. This is not a capability to add alongside core; it is an
 unfinished primitive inside it.
 
-The cost to a fixed-base arm is a `case` branch it never reaches. The state
-representation change is internal and additive.
+The cost to a fixed-base arm is a `case` branch it never reaches, plus a
+mechanical migration where the state API is renamed. See the breaking-change
+surface below.
 
 ---
 
@@ -222,26 +225,41 @@ rotations expressed in a chosen frame — exact and singularity-free as a
 
 ### State API
 
-Additive, so no existing arm code changes:
+There is **one** state API, and it changes. `bb` is pre-1.0, and the alternative —
+keeping a scalar-only `get_all_positions/1` alongside a new multi-DoF accessor —
+means two ways to read the same ETS table, one of which silently omits joints. A
+function called "get all positions" that returns some of them is a lying API, and
+maintaining the translation between the two is a permanent cost paid to avoid a
+one-off migration across 21 call sites.
+
+So the existing functions are **renamed and retyped**, and the old names are
+deleted:
+
+| Before | After |
+|---|---|
+| `get_all_positions(state)` | `get_all_configurations(state)` |
+| `set_positions(state, map)` | `set_configurations(state, map)` |
+| `get_chain_positions(state, link)` | `get_chain_configurations(state, link)` |
+| `compute_joint_transform(robot, positions, name)` | `compute_joint_transform(robot, configurations, name)` |
 
 ```elixir
-# Unchanged. Still %{atom() => float()}; multi-DoF joints are absent from it.
-BB.Robot.State.get_all_positions(state)
-BB.Robot.State.set_positions(state, %{shoulder: 0.5})
-
-# New. Returns every joint, in its type-appropriate shape.
 BB.Robot.State.get_all_configurations(state)
-# => %{shoulder: 0.5, base: %BB.Math.Transform{...}}
+# => %{shoulder: 0.5, elbow: -0.2, base: %BB.Math.Transform{...}}
 
+BB.Robot.State.set_configurations(state, %{shoulder: 0.5, base: transform})
 BB.Robot.State.get_configuration(state, :base)
 BB.Robot.State.set_configuration(state, :base, transform)
 ```
 
-Keeping `get_all_positions/1` scalar-only is a deliberate choice: it means
-existing callers cannot silently receive a shape they were never written to
-handle. Anything that wants the full picture opts in by name.
+**The rename is the point, not incidental.** "Position" is the wrong word for a
+4×4 homogeneous transform; "configuration" is the standard term for a point in a
+robot's configuration space and is correct for every joint type. More usefully,
+renaming makes the break *visible*: had the names been kept and only the types
+widened, every existing call site would still compile and then fail at runtime on
+a shape it wasn't written for. Renaming turns all 21 into compile errors that get
+looked at.
 
-`set_configuration/3` validates arity and type against the joint, so a
+`set_configuration/3` validates the value's shape against the joint type, so a
 three-tuple aimed at a revolute joint is an error rather than a wrong pose.
 
 **Writes are whole-configuration and atomic.** There is no API for setting part
@@ -393,17 +411,50 @@ DSL work is not.
 
 ### Message payloads
 
-`BB.Message.Sensor.JointState` carries parallel `names`/`positions`/
-`velocities`/`efforts` lists of floats. A floating joint's pose does not fit.
+`BB.Message.Sensor.JointState` carries parallel `names`/`positions`/`velocities`/
+`efforts` lists of floats. A floating joint fits none of the three value lists.
 
-Rather than overload `JointState`, multi-DoF joints publish their state as
-`BB.Message.Estimator.Pose`, which already exists and is exactly the right
-shape. `JointState` continues to describe single-DoF joints only, and its
-documentation is updated to say so.
+The tempting workaround is to leave `JointState` alone, declare it single-DoF
+only, and publish multi-DoF state as `BB.Message.Estimator.Pose` instead. **That
+is the wrong call.** It would mean a robot's joint state is split across two
+message types on two topics, so any consumer wanting the whole configuration —
+`bb_liveview`, `bb_kino`, a logger, a policy — has to subscribe to both and
+correlate them by timestamp to reconstruct one instant. That is a permanent tax on
+every consumer, levied to avoid changing one message.
 
-Velocity for a floating joint is a 6-vector twist rather than a scalar. Whether
-that needs a new payload or fits in `BB.Message.Estimator.Odometry` is left as an
-open question, since nothing in this proposal produces one yet.
+So `JointState` changes to carry type-appropriate values, matching the state API:
+
+| Joint type | `positions` | `velocities` | `efforts` |
+|---|---|---|---|
+| single-DoF | `float` | `float` | `float` |
+| `:planar` | `{x, y, θ}` | `{vx, vy, ω}` | `{fx, fy, τ}` |
+| `:floating` | `Transform` | `Twist` | `Wrench` |
+
+`BB.Message.Geometry.Twist` (linear and angular `Vec3`) and
+`BB.Message.Geometry.Wrench` (force and torque `Vec3`) **already exist in core** and
+are exactly the right shapes, so this needs no new types.
+
+**All three lists change at once, deliberately.** `velocities` and `efforts` have
+precisely the same problem as `positions`, and breaking a widely-consumed message
+twice is worse than breaking it once. Doing only what this proposal strictly needs
+would mean revisiting `JointState` again the moment anything reports a floating
+joint's twist.
+
+#### Breaking-change surface
+
+Stated plainly, since it's the cost of not papering over this:
+
+| Change | Call sites | Packages affected |
+|---|---|---|
+| State API rename and retype | 21 | `bb`, `bb_ik_dls`, `bb_ik_fabrik`, `bb_policy`, `bb_example_so101` |
+| `BB.IK.Solver.solve/5` → `solve/6` | 3 in `BB.Motion`, plus both solvers | `bb`, `bb_ik_dls`, `bb_ik_fabrik` |
+| `JointState` value types | 24 files | `bb`, `bb_kino`, `bb_liveview`, `bb_pid_controller`, `bb_jido`, `bb_mcp`, all four `bb_servo_*` |
+
+The `JointState` change is the widest, and most of those consumers only ever see
+single-DoF joints, so in practice their handling is unchanged — but their type
+specs and any exhaustive pattern matches need review. `bb` being pre-1.0 is what
+makes this affordable; it will not be later, which is an argument for doing it now
+rather than after more consumers exist.
 
 ### Explicitly out of scope
 
@@ -498,13 +549,21 @@ end
 BB.Robot.State.set_configuration(state, :base, pose_transform)
 ```
 
-Nothing about an existing arm changes:
+An existing arm's *behaviour* is unchanged — the same joints, the same values, the
+same kinematics — but the calls are renamed:
 
 ```elixir
-# Still exactly as it was.
+# Before
 BB.Robot.State.set_positions(state, %{shoulder: 0.5, elbow: -0.2})
 positions = BB.Robot.State.get_all_positions(state)
+
+# After
+BB.Robot.State.set_configurations(state, %{shoulder: 0.5, elbow: -0.2})
+configurations = BB.Robot.State.get_all_configurations(state)
 ```
+
+A single-DoF joint's value is still a bare float, so only the function name
+changes. That is the whole migration for an arm.
 
 ---
 
@@ -517,9 +576,10 @@ positions = BB.Robot.State.get_all_positions(state)
 - [ ] `compute_joint_transform/3` returns the correct transform for `:floating`
       from a stored `BB.Math.Transform`
 - [ ] `BB.Robot.State` stores multi-DoF configurations, with
-      `get_configuration/2`, `set_configuration/3`, `get_all_configurations/1`
-- [ ] `get_all_positions/1` and `set_positions/2` keep their existing scalar
-      contract and behaviour
+      `get_configuration/2`, `set_configuration/3`, `get_all_configurations/1`,
+      `set_configurations/2`, `get_chain_configurations/2`
+- [ ] The former `get_all_positions/1`, `set_positions/2` and
+      `get_chain_positions/2` are **removed**, not retained as shims
 - [ ] `set_configuration/3` rejects a value whose shape doesn't match the joint
       type
 - [ ] `chain_tensors/3` expands multi-DoF joints into the vectorised form the
@@ -545,8 +605,11 @@ positions = BB.Robot.State.get_all_positions(state)
 - [ ] `bb_ik_dls` solves chains containing multi-DoF joints
 - [ ] A solve scoped `source_link: :body` on a floating-base robot produces a
       chain containing no multi-DoF joint, and `bb_ik_fabrik` handles it
-- [ ] `BB.Message.Sensor.JointState` documents that it describes single-DoF
-      joints only
+- [ ] `BB.Message.Sensor.JointState` carries type-appropriate values in all
+      three of `positions`, `velocities` and `efforts`, using the existing
+      `BB.Message.Geometry.Twist` and `Wrench` for floating joints
+- [ ] Every `JointState` consumer across the ecosystem is migrated, not just the
+      ones that will see multi-DoF joints
 - [ ] Round-trip tests: a configuration set, then read back through FK, produces
       the expected pose for both new types
 - [ ] Regression tests proving fixed-base arm kinematics are unchanged
@@ -558,7 +621,6 @@ positions = BB.Robot.State.get_all_positions(state)
 - [ ] Documentation in both solver packages stating which joint types they handle,
       and that a chain containing a multi-DoF joint is outside `bb_ik_fabrik`'s
       competence
-- [ ] Velocity/twist representation for multi-DoF joints
 - [ ] `BB.Robot.Topology` path helpers aware of per-joint DoF
 
 ### Won't Have
@@ -600,10 +662,11 @@ positions = BB.Robot.State.get_all_positions(state)
    delta means. Should follow whatever makes `bb_ik_dls` correct with the least
    special-casing, and interacts with question 1.
 
-4. **Velocity for a multi-DoF joint.** A floating joint's velocity is a 6-vector
-   twist rather than a scalar. Whether that needs a new payload or fits
-   `BB.Message.Estimator.Odometry` is unresolved, but nothing in this proposal
-   produces one yet.
+4. **A planar joint's velocity and effort shape.** The proposal uses `{vx, vy, ω}`
+   and `{fx, fy, τ}` to match the configuration's `{x, y, θ}`. The alternative is
+   `Twist`/`Wrench` with the out-of-plane components zero, which is more uniform
+   with floating joints but lets a producer emit a physically impossible
+   out-of-plane value. Minor either way.
 
 5. **Should `source_link` be positional or an option?** This proposal makes it
    positional in the callback, so implementations cannot ignore it, while callers
@@ -611,6 +674,14 @@ positions = BB.Robot.State.get_all_positions(state)
    threading it through `opts` everywhere — is less disruptive to solver
    implementations but lets one silently ignore it, which is the failure mode the
    change exists to prevent.
+
+6. **Should `source_link` default at all?** Defaulting to the root was agreed for
+   convenience, but given the willingness to break things it is worth asking. The
+   root is the correct source for a fixed-base arm and the *wrong* one for a
+   floating-base robot, where it silently produces the contaminated chain — so the
+   default is simultaneously the ergonomic choice and the footgun. Requiring it
+   explicitly would make every solve state its scope, at the cost of noise in the
+   overwhelmingly common arm case.
 
 ---
 
