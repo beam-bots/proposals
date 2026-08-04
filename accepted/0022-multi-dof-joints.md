@@ -291,111 +291,105 @@ affected differently, and the difference is worth stating plainly:
   configuration API rather than the scalar one.
 - **`bb_ik_fabrik`** — FABRIK is not Jacobian-based. It is a heuristic that
   iteratively repositions joints along a chain, and a 6-DoF floating base has no
-  meaningful interpretation in that scheme. FABRIK must not silently mis-solve.
+  meaningful interpretation in that scheme.
 
-This asymmetry is a genuine capability difference between the two solvers and
-should be surfaced rather than papered over.
+The asymmetry is real, but it is a property of the **chain** rather than the
+robot. A legged robot whose body floats is a perfectly good FABRIK problem when
+each leg is solved from body to foot, because those chains contain nothing but
+revolute joints. So the answer is not to refuse solvers on robots — it is to let
+the caller say which chain they mean, which today they cannot.
 
-#### Declaring solver capability
+Both packages should document which joint types they handle, and that a chain
+containing a multi-DoF joint is outside `bb_ik_fabrik`'s competence.
 
-The mechanism matters here, because the obvious one doesn't reach. A solver
-cannot inspect a robot's DSL state at compile time: `BB.IK.Solver`
-implementations are **not declared in the DSL at all** — there is no mention of
-solvers anywhere in `BB.Dsl`. A solver is chosen per call, as
-`BB.Motion.move_to(Robot, link, target, solver: BB.IK.FABRIK)`. So an
-`@after_verify` hook in `bb_ik_fabrik` has no robot to look at, and one on the
-robot module has no idea which solver will be used.
+#### Scoping a solve with a source link
 
-The minimum that makes any check possible is a capability declaration on the
-behaviour itself:
+Enforcing solver/chain compatibility is out of scope — a future motion-planning
+DSL extension is the likely home for it, and until then solvers are called
+programmatically and the developer is responsible for asking only for chains that
+make sense. But the developer currently has **no way to express the chain they
+mean**, and that gap has to close for multi-DoF joints to be usable at all.
 
-```elixir
-defmodule BB.IK.Solver do
-  @doc """
-  The joint types this solver can handle.
-
-  Optional. A solver that doesn't implement it is assumed to support the
-  single-DoF types only, so an existing or third-party solver that never
-  contemplated multi-DoF joints reports the truth without being edited.
-  """
-  @callback supported_joint_types() :: [atom()]
-
-  @optional_callbacks supported_joint_types: 0
-end
-```
+The `BB.IK.Solver` callback is:
 
 ```elixir
-# bb_ik_fabrik
-def supported_joint_types, do: [:fixed, :revolute, :continuous, :prismatic]
-
-# bb_ik_dls
-def supported_joint_types,
-  do: [:fixed, :revolute, :continuous, :prismatic, :planar, :floating]
+@callback solve(
+            robot :: Robot.t(),
+            state_or_positions :: Robot.State.t() | positions(),
+            target_link :: atom(),
+            target :: target(),
+            opts :: opts()
+          ) :: solve_result()
 ```
 
-The permissive default matters: a solver that predates this proposal reports the
-truth without its author touching it.
+There is no source. Both solvers derive their chain with
+`Robot.path_to(robot, target_link)`, and `BB.Robot.Topology.path_to/2` returns the
+path **from the root**. So every solve implicitly spans root-to-target.
 
-#### Compatibility is a property of the chain, not the robot
+For a fixed-base arm that is exactly right. For a robot whose base floats it is
+usually wrong: a legged robot solving for a foot wants the chain from the *body*,
+not from a root that includes the floating base joint. Under the current callback
+that chain cannot be asked for, which means the only available solve drags a
+6-DoF joint into a problem that has no business containing one.
 
-This proposal deliberately stops at the callback and does **not** enforce it,
-because enforcement is harder than it first appears and belongs elsewhere.
+So this proposal changes the callback to take both ends:
 
-The naive check — "this robot has a floating joint, so refuse FABRIK" — is wrong.
-Consider a legged robot: the body floats, but each leg is solved as its own chain
-from body to foot, and those chains contain nothing but revolute joints. FABRIK
-is a perfectly good choice there. A robot-level check would false-positive on
-exactly the case where the solver is being used correctly.
+```elixir
+@callback solve(
+            robot :: Robot.t(),
+            state_or_positions :: Robot.State.t() | positions(),
+            source_link :: atom(),
+            target_link :: atom(),
+            target :: target(),
+            opts :: opts()
+          ) :: solve_result()
+```
 
-So the question is never "does this solver support this robot" but "does this
-solver support **this chain**" — which depends on which chain is being solved, and
-therefore on how the caller has scoped the problem.
+Solver implementations must handle both. Callers get a default: `BB.Motion`'s
+`move_to/4`, `move_to_multi/4`, and the `solve_only*` functions default
+`source_link` to the robot's root link, so every existing call site behaves
+identically. The two per-package convenience modules (`BB.IK.DLS.Motion`,
+`BB.IK.FABRIK.Motion`) do the same.
 
-That has two consequences:
+This also makes the walking robot expressible with the solvers that exist:
 
-1. **A runtime check is possible but is the wrong shape.** `BB.Motion` could
-   compare the chain's joint types against `supported_joint_types/0` on every
-   call. It would be correct, but a wrong solver choice is a *configuration*
-   error, and configuration errors should surface when the configuration is
-   written, not when the robot is running.
+```elixir
+# The chain contains only revolute joints, so FABRIK is a fine choice —
+# the floating base is simply not part of the problem.
+BB.Motion.move_to(robot, :front_left_foot, target,
+  source_link: :body,
+  solver: BB.IK.FABRIK
+)
+```
 
-2. **A compile-time check needs the chains to be declarable.** For a Spark
-   verifier to check anything, the robot has to know which solver solves which
-   chain. That means expressing solver configuration in the DSL — something
-   closer to
+##### A new topology operation
 
-   ```elixir
-   # Illustrative only; the real shape needs design work.
-   settings do
-     ik_solver :legs, {BB.IK.FABRIK, max_iterations: 50},
-       chains: [{:body, :front_left_foot}, {:body, :front_right_foot}]
+`BB.Robot.Topology` currently offers only `path_to/2`, root-relative and served
+from a precomputed `paths` map. A source link needs a path *between* two links:
 
-     ik_solver :arm, {BB.IK.DLS, max_iterations: 100},
-       chains: [{:torso, :gripper}]
-   end
-   ```
+```elixir
+BB.Robot.Topology.path_between(topology, source_link, target_link)
+```
 
-   at which point `@after_verify` — already an established pattern in `bb`, via
-   `BB.Error`'s `@after_verify {BB.Error, :__verify_severity_impl__}` — can
-   compare each declared chain's joint types against its solver's declared
-   support and fail the build.
+Restricted to the case where **`source_link` is an ancestor of `target_link`**,
+which is a prefix drop on the existing precomputed paths and therefore cheap. It
+covers the motivating cases — body-to-foot, torso-to-gripper — and anything else
+returns an error.
 
-That is a substantial design problem in its own right: it has to express chains,
-per-chain solver options, and probably per-chain solver *selection* at runtime,
-and it interacts with what the root link means once the base floats. It is not
-something to smuggle into a proposal about joint types.
+The general case, where the two links share only a common ancestor, requires
+traversing *up* the tree from the source before descending to the target, which
+means composing inverted joint transforms and reasoning about what a joint's
+position means when traversed backwards. That is a real piece of work with no
+current use case, and it is deferred.
 
-It is also worth doing independently of multi-DoF joints. Solver options are
-currently an untyped keyword list with no schema or validation, and `bb_ik_dls`
-and `bb_ik_fabrik` already disagree on their `max_iterations` defaults — 100
-against 50 — with nothing to reconcile them. Declaring solvers in the DSL would
-bring them under the same option validation every other component gets.
+##### Why this belongs here rather than with the deferred DSL work
 
-**Consequence for sequencing.** Until that proposal lands there is no check, and
-FABRIK handed a chain containing a multi-DoF joint will produce a wrong answer
-rather than a refusal. That is a real gap and it is called out in Open Questions
-rather than papered over with a runtime error that the eventual compile-time check
-would replace.
+It is the minimum that makes multi-DoF joints usable with the solvers that exist
+today. Without it the only expressible chain starts at the root, so a floating
+base contaminates every solve on the robot and the joint types this proposal
+implements would be unusable in practice with `bb_ik_fabrik` and awkward with
+`bb_ik_dls`. It is also small, mechanical, and backwards-compatible, which the
+DSL work is not.
 
 ### Message payloads
 
@@ -537,10 +531,20 @@ positions = BB.Robot.State.get_all_positions(state)
       the table
 - [ ] `set_configuration/3` writes a whole configuration; there is no partial
       update API
-- [ ] `BB.IK.Solver` gains an optional `supported_joint_types/0` callback,
-      defaulting to the single-DoF types when unimplemented
-- [ ] `bb_ik_fabrik` declares single-DoF support only
-- [ ] `bb_ik_dls` declares multi-DoF support and solves such chains
+- [ ] `BB.IK.Solver.solve/5` becomes `solve/6`, taking `source_link` ahead of
+      `target_link`
+- [ ] `BB.Robot.Topology.path_between/3`, restricted to a source that is an
+      ancestor of the target, erroring otherwise
+- [ ] `BB.Motion.move_to/4`, `move_to_multi/4`, and the `solve_only*` functions
+      accept `source_link`, defaulting to the robot's root link, so every existing
+      call site behaves identically
+- [ ] `bb_ik_dls` and `bb_ik_fabrik` implement `solve/6` and derive their chain
+      from `path_between/3` rather than `path_to/2`
+- [ ] `BB.IK.DLS.Motion` and `BB.IK.FABRIK.Motion` accept and default
+      `source_link` the same way
+- [ ] `bb_ik_dls` solves chains containing multi-DoF joints
+- [ ] A solve scoped `source_link: :body` on a floating-base robot produces a
+      chain containing no multi-DoF joint, and `bb_ik_fabrik` handles it
 - [ ] `BB.Message.Sensor.JointState` documents that it describes single-DoF
       joints only
 - [ ] Round-trip tests: a configuration set, then read back through FK, produces
@@ -552,8 +556,8 @@ positions = BB.Robot.State.get_all_positions(state)
 - [ ] A compile-time verifier rejecting `axis` on a `:floating` joint, and
       requiring it on `:planar`
 - [ ] Documentation in both solver packages stating which joint types they handle,
-      and that `bb_ik_fabrik` on a chain containing a multi-DoF joint is wrong
-      until solver declaration lands
+      and that a chain containing a multi-DoF joint is outside `bb_ik_fabrik`'s
+      competence
 - [ ] Velocity/twist representation for multi-DoF joints
 - [ ] `BB.Robot.Topology` path helpers aware of per-joint DoF
 
@@ -567,52 +571,46 @@ positions = BB.Robot.State.get_all_positions(state)
       declaring one does not stop a solver commanding sideways motion a
       differential-drive base can't achieve. The constraint belongs with the drive
       description, not the joint
-- [ ] Declaring IK solvers and their chains in the DSL, and the compile-time
-      verification that depends on it. Needs its own proposal
-- [ ] Any enforcement of solver/joint-type compatibility. This proposal ships the
-      callback as metadata only
+- [ ] Declaring IK solvers or their chains in the DSL. Solvers continue to be
+      called programmatically, and a future motion-planning DSL extension is the
+      likely home for declaring them
+- [ ] Any enforcement of solver/joint-type compatibility, at compile time or
+      runtime. The developer is responsible for asking a solver only for chains it
+      can handle; this proposal's contribution is making the chain *expressible*
+- [ ] Paths between links that share only a common ancestor, which would require
+      composing inverted joint transforms
 
 ---
 
 ## Open Questions
 
-1. **Solver and chain declaration in the DSL.** The largest thing this proposal
-   defers, and a prerequisite for compile-time verification of solver/joint-type
-   compatibility. It has to express chains, per-chain solver selection and
-   options, and it interacts with question 2. Needs its own proposal; see
-   "Compatibility is a property of the chain, not the robot".
-
-2. **Root link semantics.** With a floating joint, is the root link still the
+1. **Root link semantics.** With a floating joint, is the root link still the
    kinematic root, or a reference frame the robot moves *within*? A legged robot
-   solved as body-to-foot chains implies the body — not the root — is the natural
-   base for those solves, which suggests "the root" and "the base a solver works
-   from" are different concepts that currently share a name. Entangled with
-   question 1 and with the follow-up frame proposal.
+   solved as body-to-foot chains suggests "the root" and "the base a solver works
+   from" are different concepts that currently share a name. Adding `source_link`
+   makes the distinction expressible without settling what the root *means*, which
+   the follow-up frame proposal will have to.
 
-3. **How much of `defn.ex` has to change.** As much as is necessary. The expansion
+2. **How much of `defn.ex` has to change.** As much as is necessary. The expansion
    may fit entirely in `chain_tensors/3`, or the kernel may need additional masks.
-   This affects effort estimation, not the design, so it wants a spike rather than
-   a decision.
+   This affects effort estimation rather than the design, so it wants a spike.
 
-4. **Which frame the floating Jacobian columns are expressed in.** Body frame and
+3. **Which frame the floating Jacobian columns are expressed in.** Body frame and
    world frame are both defensible, and the choice changes what an IK solver's
    delta means. Should follow whatever makes `bb_ik_dls` correct with the least
-   special-casing, but interacts with question 2 — if the solver's base is the body
-   rather than the root, that likely settles it.
+   special-casing, and interacts with question 1.
 
-5. **The gap before solver declaration lands.** Between this proposal and the
-   solver proposal, `bb_ik_fabrik` handed a chain containing a multi-DoF joint
-   produces a wrong answer with nothing to catch it. Options: ship the two
-   proposals together; ship this one and accept the window, documented in both
-   solver packages; or add a temporary runtime refusal that the compile-time check
-   later replaces. The third contradicts the preference for compile-time
-   diagnostics over runtime ones, so it is listed for completeness rather than
-   recommended.
-
-6. **Velocity for a multi-DoF joint.** A floating joint's velocity is a 6-vector
+4. **Velocity for a multi-DoF joint.** A floating joint's velocity is a 6-vector
    twist rather than a scalar. Whether that needs a new payload or fits
    `BB.Message.Estimator.Odometry` is unresolved, but nothing in this proposal
    produces one yet.
+
+5. **Should `source_link` be positional or an option?** This proposal makes it
+   positional in the callback, so implementations cannot ignore it, while callers
+   get a defaulted `:source_link` option through `BB.Motion`. The alternative —
+   threading it through `opts` everywhere — is less disruptive to solver
+   implementations but lets one silently ignore it, which is the failure mode the
+   change exists to prevent.
 
 ---
 
