@@ -260,7 +260,11 @@ a shape it wasn't written for. Renaming turns all 21 into compile errors that ge
 looked at.
 
 `set_configuration/3` validates the value's shape against the joint type, so a
-three-tuple aimed at a revolute joint is an error rather than a wrong pose.
+three-tuple aimed at a revolute joint is an error rather than a wrong pose. It
+reports `BB.Error.Invalid.JointConfig`, which already exists with
+`fields: [:joint, :field, :value, :expected, :message]` and fits without
+modification — `joint: :base, field: :configuration, value: 0.5,
+expected: "a {x, y, θ} tuple"`.
 
 **Writes are whole-configuration and atomic.** There is no API for setting part
 of a floating joint — no "just the yaw". A partial-update API invites
@@ -428,8 +432,73 @@ BB.Robot.path_between(robot, source_link, target_link)
 
 Restricted to the case where **`source_link` is an ancestor of `target_link`**,
 which is a prefix drop on the existing precomputed paths and therefore cheap. It
-covers the motivating cases — body-to-foot, torso-to-gripper — and anything else
-returns an error.
+covers the motivating cases — body-to-foot, torso-to-gripper.
+
+##### It returns structured errors, not `nil`
+
+`path_to/2` returns `nil` on a miss, and both solvers translate that themselves:
+
+```elixir
+# bb_ik_dls/lib/bb/ik/dls.ex:225 and bb_ik_fabrik/lib/bb/ik/fabrik/chain.ex:65
+case Robot.path_to(robot, target_link) do
+  nil -> {:error, %UnknownLink{target_link: target_link}}
+  path -> ...
+end
+```
+
+Two things wrong with that, both worth fixing while here. The translation is
+duplicated in every caller, so a caller that forgets it propagates a bare `nil`
+into arithmetic and fails somewhere unrelated. And both call sites construct
+`UnknownLink` with only `target_link` set, leaving the `:robot` field the error
+type already provides unpopulated — so the diagnostic is weaker than the type
+allows.
+
+`path_between/3` therefore returns `{:ok, [atom()]} | {:error, BB.Error.t()}` and
+does the diagnosis itself, distinguishing three failures rather than collapsing
+them into one:
+
+| Failure | Error |
+|---|---|
+| `source_link` doesn't exist | `BB.Error.Kinematics.UnknownLink`, `role: :source` |
+| `target_link` doesn't exist | `BB.Error.Kinematics.UnknownLink`, `role: :target` |
+| source is not an ancestor of target | `BB.Error.Kinematics.DisjointChain` (new) |
+
+`DisjointChain` carries the **nearest common ancestor**, which turns the message
+from a complaint into an instruction:
+
+```elixir
+defmodule BB.Error.Kinematics.DisjointChain do
+  use BB.Error,
+    class: :kinematics,
+    fields: [:source_link, :target_link, :common_ancestor]
+
+  def message(%{source_link: source, target_link: target, common_ancestor: nil}) do
+    "#{inspect(source)} and #{inspect(target)} are not connected"
+  end
+
+  def message(%{source_link: source, target_link: target, common_ancestor: ancestor}) do
+    "#{inspect(source)} is not an ancestor of #{inspect(target)}; " <>
+      "their nearest common ancestor is #{inspect(ancestor)}"
+  end
+end
+```
+
+So asking for `:left_gripper` to `:right_gripper` tells you to pass `:torso`,
+rather than handing back a `nil` to trace.
+
+##### `UnknownLink` needs a `:role`
+
+`BB.Error.Kinematics.UnknownLink` currently has `fields: [:target_link, :robot]`.
+With two link parameters, reporting an unknown *source* as `target_link` is
+actively misleading. The field becomes `:link` with a new `:role` of `:source` or
+`:target`, which is a breaking change to an error struct across its nine usages.
+
+##### `path_to/2` should change too
+
+The same argument applies to `path_to/2`, and leaving it returning `nil` while its
+sibling returns structured errors is a worse inconsistency than either choice
+alone. Changing it to `{:ok, path} | {:error, UnknownLink.t()}` also deletes the
+duplicated translation from both solvers. Five call sites.
 
 The general case, where the two links share only a common ancestor, requires
 traversing *up* the tree from the source before descending to the target, which
@@ -487,6 +556,8 @@ Stated plainly, since it's the cost of not papering over this:
 | `BB.IK.Solver.solve/5` → `solve/6` | 3 in `BB.Motion`, plus both solvers | `bb`, `bb_ik_dls`, `bb_ik_fabrik` |
 | `:source_link` required by `BB.Motion` | ~47, many in doc examples | `bb`, `bb_ik_dls`, `bb_ik_fabrik`, `bb_example_so101`, `bb_example_wx200` |
 | `JointState` value types | 24 files | `bb`, `bb_kino`, `bb_liveview`, `bb_pid_controller`, `bb_jido`, `bb_mcp`, all four `bb_servo_*` |
+| `path_to/2` returns a result tuple | 5 | `bb`, `bb_ik_dls`, `bb_ik_fabrik` |
+| `UnknownLink` field rename | 9 | `bb`, `bb_ik_dls`, `bb_ik_fabrik` |
 
 The `JointState` change is the widest, and most of those consumers only ever see
 single-DoF joints, so in practice their handling is unchanged — but their type
@@ -654,8 +725,17 @@ changes. That is the whole migration for an arm.
 - [ ] `BB.IK.Solver.solve/6` takes `source_link` ahead of `target_link`, and
       `solve/5` is **removed** rather than kept as a defaulting clause
 - [ ] `BB.Robot.Topology.path_between/3`, restricted to a source that is an
-      ancestor of the target, erroring otherwise, delegated from
-      `BB.Robot.path_between/3`
+      ancestor of the target, delegated from `BB.Robot.path_between/3`
+- [ ] `path_between/3` returns `{:ok, path} | {:error, BB.Error.t()}`, never `nil`,
+      distinguishing unknown source, unknown target, and disjoint chain
+- [ ] `BB.Error.Kinematics.DisjointChain`, carrying the nearest common ancestor so
+      the message names the link the caller should have passed
+- [ ] `BB.Error.Kinematics.UnknownLink` gains `:role` and its `:target_link` field
+      becomes `:link`, so an unknown source isn't reported as a target
+- [ ] `path_to/2` returns `{:ok, path} | {:error, UnknownLink.t()}` rather than
+      `nil`, and the duplicated translation is deleted from both solvers
+- [ ] `set_configuration/3` reports `BB.Error.Invalid.JointConfig` on a shape
+      mismatch, populating `:expected`
 - [ ] `BB.Robot.root_link/1` accessor, alongside the existing topology
       introspection functions
 - [ ] `BB.Motion.move_to/4`, `move_to_multi/4`, and the `solve_only*` functions
@@ -730,11 +810,14 @@ changes. That is the whole migration for an arm.
    with floating joints but lets a producer emit a physically impossible
    out-of-plane value. Minor either way.
 
-5. **Should `path_between/3` return an error or raise on a non-ancestor source?**
-   Every other topology lookup returns `nil` for a miss (`get_link/2`,
-   `path_to/2`), which argues for consistency — but a non-ancestor source is a
-   programming error rather than a lookup miss, and returning `nil` would let it
-   surface later as a confusingly empty chain.
+5. **How far should the `nil`-to-structured-error change reach?** This proposal
+   converts `path_to/2` alongside `path_between/3`, since leaving siblings
+   inconsistent is worse than either choice. But `get_link/2`, `get_joint/2`,
+   `parent_joint/2`, and `actuator_path/2` all still return `nil`. Converting them
+   too would be consistent and is a larger, purely mechanical change; converting
+   none of them leaves the same wart elsewhere. Arguably these are genuine
+   *lookups* where `nil` is a reasonable answer, whereas a path is a computation
+   whose failure has a diagnosable cause — but that line is thin.
 
 ---
 
