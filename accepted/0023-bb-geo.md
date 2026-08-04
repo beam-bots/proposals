@@ -119,6 +119,22 @@ A `BB.GNSS` behaviour would sit between two behaviours that already cover both
 halves. So the shared thing is a *message plus a maths library*, not a callback
 contract.
 
+### No estimator lives here
+
+A `BB.Estimator` fusing a fix with AHRS orientation into a pose — the thing that
+would drive Proposal 0022's floating joint — does **not** belong in this package.
+
+The test is whether any of it is *geo-specific*. It isn't. The coordinate
+conversion is geo-specific, but that is a pure function this package already
+provides. Everything else — fusing two input streams, gating on input validity,
+handling stale inputs, publishing derived state — is exactly what `BB.Estimator`
+(Proposal 0018) already abstracts, and is identical whether the input is GNSS,
+wheel odometry, or visual odometry.
+
+So the split is: `bb_geo` turns degrees into metres; a generic estimator turns
+metres into a pose. Putting the estimator here would tie generic fusion machinery
+to one sensor modality.
+
 ### Configuration is where receivers actually differ
 
 The observation that motivated this proposal: across vendors, sensor output is
@@ -156,14 +172,27 @@ end
 
 ```elixir
 defmodule BB.Geo.LLA do
-  @moduledoc "A geodetic coordinate: degrees, degrees, metres above the ellipsoid."
-  defstruct [:latitude, :longitude, :altitude, :ellipsoid]
+  @moduledoc """
+  A geodetic coordinate.
+
+  `latitude` and `longitude` are degrees. `height` is metres **above the
+  reference ellipsoid** — not above mean sea level, and not above terrain.
+
+  The distinction matters and is the commonest source of vertical error in
+  GNSS work: the geoid departs from the WGS 84 ellipsoid by roughly -105 m to
+  +85 m depending on where you are. A receiver reports both, and confusing them
+  puts you tens of metres out with no other symptom.
+  """
+
+  defstruct [:latitude, :longitude, :height, :ellipsoid]
 end
 ```
 
-`altitude` is unambiguously **height above the ellipsoid**, not above mean sea
-level. Geoid separation is a distinct concern and receivers report both; keeping
-the struct's meaning fixed prevents the commonest vertical error.
+**`height` and `altitude` are two different words for two different things,
+consistently across the ecosystem.** `height` is always above the ellipsoid;
+`altitude` is always above mean sea level. `BB.Geo.Message.NavSatFix` already
+carries both under exactly those names, so `LLA.height` matches rather than
+inventing a third convention. Nothing anywhere should use "altitude" loosely.
 
 ### Conversions
 
@@ -201,6 +230,13 @@ BB.Geo.LocalFrame.to_local(frame, %LLA{}) :: Vec3.t()
 BB.Geo.LocalFrame.from_local(frame, Vec3.t()) :: LLA.t()
 ```
 
+`LocalFrame` provides the **mechanism** for anchoring a local frame. It does not
+decide the **policy** — whether the origin is the first usable fix, a constant
+configured for the site, or something that migrates as the robot travels. That is
+a robot-configuration concern and belongs in the DSL, most likely as part of the
+future motion-planning extension (Proposal 0006) rather than here. This package
+takes an origin and converts against it.
+
 **Both ENU and NED are first-class and must be named at construction.** There is
 no default. Robotics and ROS conventionally use ENU for map frames; aerospace,
 MAVLink, and u-blox's own `NAV-PVT` velocity fields use NED. Silently picking one
@@ -220,16 +256,65 @@ Two distance methods because the tradeoff is real: haversine is cheap and wrong
 by up to 0.5%; Karney's algorithm is accurate and iterative. Naming the method at
 the call site makes the choice explicit rather than hidden in a default.
 
-### Numeric precision
+### Implemented with Nx
+
+The coordinate transforms are written as `defn`, not plain Elixir float
+arithmetic. Four reasons, in ascending order of importance:
+
+1. **Composition.** `BB.Math.Vec3`, `Transform`, and `Covariance3` are all
+   tensor-backed. Geo maths that speaks the same language chains with them
+   without marshalling at every boundary.
+2. **Consistency.** `bb`'s kinematics is already `defn` (`BB.Robot.Kinematics.Defn`,
+   `BB.Math.Defn`), so this is the established idiom rather than a new one.
+3. **Batching for free.** The same code converts one fix or a hundred thousand.
+   A robot rarely needs that; offline log analysis, map building, and trajectory
+   post-processing do, and they get it without a second implementation.
+4. **Differentiability.** This is the one that decides it. A Kalman or factor-graph
+   estimator fusing GNSS needs the Jacobian of its measurement model — which is
+   the Jacobian of the geodetic-to-local transform. Written as `defn`, that comes
+   from `Nx.Defn.grad/1`. Written as plain floats, somebody hand-derives it, gets
+   it subtly wrong, and the filter diverges in a way that looks like bad GPS.
+
+Given `bb` already has `BB.Estimator` and this package exists partly to feed it,
+hand-derived Jacobians would be a trap laid for our own future selves.
+
+#### One carve-out: Karney's geodesic
+
+`defn` suits closed-form and fixed-iteration maths. It suits data-dependent
+iteration poorly, because the loop count has to be static to compile and
+vectorise.
+
+- **`lla_to_ecef/1`** is closed-form. `defn`.
+- **`ecef_to_lla/2`** is Bowring's method, which converges to sub-millimetre in a
+  *fixed* one or two iterations and so unrolls cleanly. `defn`.
+- **Local frame conversions** are a subtraction and a matrix multiply. `defn`,
+  and the batching benefit is real here since converting a whole track is one
+  call.
+- **Haversine** is closed-form. `defn`.
+- **Karney's geodesic** is series expansions with data-dependent convergence.
+  Plain Elixir. Forcing it into `defn` would mean a worst-case fixed iteration
+  count on every call and would not vectorise usefully anyway.
+
+#### Precision, and a backend trap
 
 All geodetic arithmetic is `:f64`. This is a correctness requirement, not a
 preference — see the `f32` ECEF resolution problem in the Motivation. `BB.Math`'s
 existing types already use `:f64` (`Covariance3` casts with
-`Nx.as_type(tensor, :f64)`), so this is consistent with core rather than novel.
+`Nx.as_type(tensor, :f64)`), so this is consistent with core.
 
-The package should state this in its usage rules and assert it in tests, because
-an innocuous `Nx.tensor([...])` without an explicit type will default to `:f32`
-and produce half-metre errors that look like GNSS noise.
+Two ways to lose it, both silent:
+
+- An innocuous `Nx.tensor([...])` without an explicit type defaults to `:f32`,
+  giving half-metre errors that look like GNSS noise.
+- **Choosing `defn` makes the backend a correctness concern, not just a
+  performance one.** Consumer GPUs are dramatically slower at `f64` than `f32`,
+  and some accelerator backends silently downcast rather than refusing. A user
+  who sets an EXLA GPU backend to speed up kinematics could quietly degrade their
+  position solution to half-metre resolution.
+
+So the package must assert `:f64` on its outputs in tests rather than assuming
+it, and its usage rules must warn about the backend interaction. This is a real
+cost of the `defn` decision and worth paying with eyes open.
 
 ### Messages
 
@@ -271,6 +356,42 @@ breaks when the driver is swapped. They live with the message:
 `constellation` covers the full set because it is a property of the satellites,
 not the receiver — BeiDou is as constellation-agnostic a concept as GPS, and a
 u-blox M8, a Unicore UM980, and an NMEA-only MediaTek module all report it.
+
+---
+
+### Verifying correctness
+
+Choosing `defn` makes correctness harder to eyeball, so the test strategy matters
+more than usual. Three tiers, in descending order of authority:
+
+**1. Authoritative reference data.** Karney's **`GeodTest.dat`** is 500,000
+geodesic cases computed to 15 nm accuracy by construction. It is what other
+implementations are themselves validated against, so it beats cross-checking
+against any of them. Published test vectors serve the same role for ECEF↔LLA.
+
+**2. Cross-checks against existing Elixir packages**, as test-only dependencies.
+Useful as characterisation, weaker than tier 1 — if a package disagrees with us,
+that alone doesn't say which is wrong.
+
+| Package | Covers | Notes |
+|---|---|---|
+| [`sidereon`](https://hex.pm/packages/sidereon) | `Coordinates.geodetic_to_itrs/1`, `to_geodetic/1`, `Geodesic.inverse/4`, `direct/4` | Near-exact surface match. MIT, Rust NIF. **Its geodetic struct uses kilometres** where ours uses metres — a 1000× error waiting to happen in the harness. ITRS rather than ECEF: same frame for our purposes, differing by centimetres. |
+| [`geocalc`](https://hex.pm/packages/geocalc) | Distance, bearing, destination | 1.3M downloads, the mature option — but **spherical** (movable-type formulas). Characterises `:haversine` only; using it for `:karney` would validate against the wrong answer. |
+| [`coord`](https://hex.pm/packages/coord) | UTM | Apache-2.0. Validated against a reference implementation over hundreds of thousands of coordinates. |
+
+Prefer `sidereon` over [`orbis`](https://hex.pm/packages/orbis) despite the
+latter's "0 ULP Skyfield parity" claim: they are the same author, `orbis`'s
+repository now 404s, and `sidereon` has the more recent release.
+
+**3. Round-trips and properties.** `lla_to_ecef |> ecef_to_lla` returning the
+input to sub-millimetre, ENU and NED agreeing after axis permutation, and so on.
+Necessary but **not sufficient** — a systematically wrong implementation round-trips
+perfectly. These catch typos, not misconceptions.
+
+Additionally, because the transforms are `defn`, the **Jacobians should be checked
+against finite differences** of the forward transform. That validates the
+differentiability the design depends on, rather than assuming `grad` produces
+something sensible.
 
 ---
 
@@ -338,7 +459,7 @@ defmodule Rover.Localisation do
                   %{frame: nil} = state) do
     origin = %BB.Geo.LLA{latitude: fix.latitude,
                          longitude: fix.longitude,
-                         altitude: fix.height}
+                         height: fix.height}
 
     {:noreply, %{state | frame: LocalFrame.new(origin, convention: :ned)}}
   end
@@ -357,8 +478,8 @@ end
 Distance and bearing to a waypoint:
 
 ```elixir
-iex> here = %BB.Geo.LLA{latitude: -41.2865, longitude: 174.7762, altitude: 0.0}
-iex> there = %BB.Geo.LLA{latitude: -41.2900, longitude: 174.7800, altitude: 0.0}
+iex> here = %BB.Geo.LLA{latitude: -41.2865, longitude: 174.7762, height: 0.0}
+iex> there = %BB.Geo.LLA{latitude: -41.2900, longitude: 174.7800, height: 0.0}
 iex> BB.Geo.distance(here, there, method: :karney)
 505.6
 iex> BB.Geo.initial_bearing(here, there)
@@ -381,12 +502,19 @@ sensor :gps, {BB.GPSD.Sensor, host: "localhost"}
 
 - [ ] `BB.Geo.Ellipsoid` with WGS 84 parameters
 - [ ] `BB.Geo.LLA` struct, documented as height above ellipsoid
+- [ ] Coordinate transforms implemented as `defn`, with Karney's geodesic the
+      documented exception
 - [ ] `lla_to_ecef/1` and `ecef_to_lla/2`, verified against published reference
       values rather than only round-tripped
+- [ ] `Nx.Defn.grad/1` produces correct Jacobians for the transforms, checked
+      against finite differences of the forward function
 - [ ] `BB.Geo.LocalFrame` supporting both `:enu` and `:ned`, with no default
 - [ ] `to_local/2` and `from_local/2` round-tripping to sub-millimetre
-- [ ] Haversine and ellipsoidal distance, initial and final bearing
-- [ ] All arithmetic in `:f64`, asserted by test
+- [ ] Haversine and ellipsoidal distance, initial and final bearing, the latter
+      verified against Karney's `GeodTest` dataset
+- [ ] All arithmetic in `:f64`, asserted by test on outputs rather than assumed
+- [ ] Usage rules warn that an accelerator backend may downcast or be slow at
+      `:f64`, making backend choice a correctness concern for this package
 - [ ] `BB.Geo.Message.NavSatFix` and `BB.Geo.Message.Satellites`
 - [ ] Shared `fix_type` / `carrier_solution` / `constellation` vocabulary
 - [ ] `bb_ublox` migrated to depend on `bb_geo` and its local payloads deleted
@@ -397,8 +525,8 @@ sensor :gps, {BB.GPSD.Sensor, host: "localhost"}
 - [ ] `BB.Geo.destination/3` — project a point along a bearing
 - [ ] UTM, and possibly MGRS
 - [ ] Geoid separation helpers, so height above mean sea level is derivable
-- [ ] Test vectors from a published dataset (e.g. Karney's `GeodTest`) rather
-      than only hand-computed cases
+- [ ] Cross-check tests against `sidereon` and `geocalc` as test-only
+      dependencies, on top of the reference data
 
 ### Won't Have
 
@@ -408,31 +536,29 @@ sensor :gps, {BB.GPSD.Sensor, host: "localhost"}
 - [ ] Kinematic or joint changes — Proposal 0022
 - [ ] Map tiles, geofencing, or route planning
 - [ ] Coordinate transforms beyond WGS 84-family datums; no full PROJ
+- [ ] A fix-to-pose estimator. Nothing about that fusion is geo-specific, so it
+      belongs with generic estimation
+- [ ] Local-frame origin *policy* — first-fix, configured, or migrating. This
+      package provides the mechanism; the policy is DSL configuration, most likely
+      in the motion-planning extension
+- [ ] Usability without `bb`. This is BB-specific and splitting a
+      dependency-free core would be speculative
 
 ---
 
 ## Open Questions
 
-1. **Does a fix-to-floating-joint estimator belong here?** Proposal 0022 makes a
-   floating joint real but leaves it unpopulated. A `BB.Estimator` fusing
-   `NavSatFix` with AHRS orientation into a pose is the obvious join between the
-   two proposals. It may want its own package, since it depends on both and on
-   `bb_estimator_ahrs`.
+1. **Which of `sidereon`'s geodesic implementations backs `inverse/4`?** It exposes
+   the standard `direct`/`inverse` geodesic problems, but those names are used by
+   both Vincenty and Karney. It matters: Vincenty fails to converge for
+   near-antipodal points and Karney does not, which is exactly the case a
+   cross-check should exercise. Determine before relying on it as a reference.
 
-2. **Which local-frame origin policy?** First-fix, configured constant, and
-   moving-origin are all reasonable. The example above uses first-fix, but a
-   robot that reboots mid-mission wants a stable configured origin. Possibly a
-   caller concern rather than a library one.
-
-3. **`altitude` naming.** `LLA.altitude` meaning height above the ellipsoid is
-   correct but invites misreading, since colloquial "altitude" means above sea
-   level. `height` — which is what `bb_ublox`'s `NavSatFix` calls it — may be
-   clearer despite being less standard for the acronym.
-
-4. **Should `bb_geo` be usable without `bb`?** The conversions are independent of
-   the framework; only the messages need `BB.Message`. Splitting a dependency-free
-   `geo` library from `bb_geo` is possible but is speculative generality unless
-   someone actually wants it.
+2. **Does `Nx.Defn.grad/1` differentiate cleanly through the unrolled Bowring
+   iteration?** The differentiability argument for `defn` assumes so. Bowring is a
+   fixed small number of iterations with no data-dependent branching, so it should,
+   but the claim should be tested rather than asserted — it is load-bearing for the
+   whole Nx decision.
 
 ---
 
