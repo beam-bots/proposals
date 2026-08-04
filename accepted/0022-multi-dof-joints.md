@@ -141,6 +141,45 @@ were stubbed in the first place — it is an IK-facing change, not just an FK on
 documentation (`lib/bb/dsl.ex:506`), so the plane is already expressible and no
 DSL change is needed for it.
 
+#### When `:planar` is the right model
+
+A planar joint is **three** degrees of freedom: two translations in the plane and
+one rotation about its normal. Not two rotations — a body constrained to a plane
+has only one rotational freedom, yaw.
+
+Whether a given base is planar turns on the *surface*, not the drive:
+
+- **Mecanum or omni base on a flat floor** — exactly `:planar`, and the case where
+  it fits best. Such a base is genuinely **holonomic**: it can translate in both
+  in-plane axes and rotate about the normal, all independently. The joint's three
+  DoF map one-to-one onto motions the robot can actually achieve, so nothing is
+  over-promised.
+- **Differential-drive or Ackermann base on a flat floor** — still kinematically
+  `:planar`, but the joint over-promises. It admits sideways translation the robot
+  cannot perform. See below.
+- **Any wheeled base on uneven terrain** — **not planar.** A rover crossing rough
+  ground pitches and rolls, and its body height changes. That is six degrees of
+  freedom, so the joint is `:floating` even though the robot is nominally
+  "driving around on the ground". Modelling it as planar discards real motion and
+  will put a mast-mounted sensor in the wrong place.
+
+That last case is worth stating plainly because "it's a ground vehicle, so it's
+planar" is the intuitive and often wrong choice.
+
+#### Non-holonomic constraints
+
+For a differential-drive or Ackermann base, `:planar` describes the
+*configuration space* correctly while admitting *velocities* the robot cannot
+realise. Nothing in this proposal prevents a solver commanding a sideways
+translation such a base can't achieve.
+
+That is left out on purpose. The constraint is a property of the drive mechanism,
+not of the joint — the same `:planar` joint is unconstrained under mecanum wheels
+and constrained under differential drive. Expressing it belongs with whatever
+describes the drive, alongside wheel radius and track width, and is entangled with
+motion planning (Proposal 0006). A holonomic joint plus a separate constraint
+description is a cleaner factoring than a joint type per drive geometry.
+
 ### Representing a multi-DoF configuration
 
 Three options were considered.
@@ -205,6 +244,42 @@ handle. Anything that wants the full picture opts in by name.
 `set_configuration/3` validates arity and type against the joint, so a
 three-tuple aimed at a revolute joint is an error rather than a wrong pose.
 
+**Writes are whole-configuration and atomic.** There is no API for setting part
+of a floating joint — no "just the yaw". A partial-update API invites
+inconsistent intermediate states, and the natural producer of a floating joint's
+configuration is an estimator emitting a complete pose, which has no use for one.
+
+#### Storage must be lossless
+
+`BB.Math.Transform` is a 4×4 `:f64` homogeneous matrix (`Nx.eye(4, type: :f64)`,
+`Nx.as_type(tensor, :f64)`). The obvious space optimisation — decompose to a
+quaternion and translation, store seven floats, recompose on read — is
+**wrong** and must not be done:
+
+- Matrix-to-quaternion is a `sqrt` with a branch on the trace, and the inverse is
+  more arithmetic. Both are lossy in the low bits.
+- 16 numbers → 7 → 16 is not a bijection. A matrix that has drifted slightly from
+  orthonormal cannot round-trip, and recomposition silently renormalises it to a
+  different matrix than the one stored.
+- The round-trip happens on **every read**, so error accumulates rather than
+  being a one-off.
+
+The whole point of holding state in ETS is that it is fast *and* correct. Store
+the tensor's bytes verbatim — `Nx.to_binary/1` gives 128 bytes for a 4×4 f64
+matrix — and recover with `Nx.from_binary/2` plus a reshape. That is bit-exact
+and involves no arithmetic at all.
+
+Storing the raw binary rather than the `%Nx.Tensor{}` struct is also
+backend-safe. A tensor struct carries backend state: fine for
+`Nx.BinaryBackend`, but under EXLA it is a reference to accelerator memory, which
+is not meaningfully shareable through ETS and may be invalidated out from under
+a reader. `bb` uses `Nx.BinaryBackend` today, but the default backend is
+user-configurable, and state storage should not silently break when someone sets
+`EXLA` to speed up kinematics.
+
+A `:planar` configuration is three floats and has no such problem; store it as a
+tuple.
+
 ### Jacobian and IK solver impact
 
 Jacobian width becomes the sum of DoF along the chain. Existing solvers are
@@ -258,37 +333,69 @@ def supported_joint_types,
   do: [:fixed, :revolute, :continuous, :prismatic, :planar, :floating]
 ```
 
-`BB.Motion` checks the chain's joint types against the solver's declared support
-once per call and refuses rather than mis-solving. The permissive default is the
-important part: a solver that predates this proposal gets a clear refusal instead
-of a wrong answer, with no change to its code.
+The permissive default matters: a solver that predates this proposal reports the
+truth without its author touching it.
 
-**Compile-time would be better, and this is the path to it.** `@after_verify` is
-already an established pattern in `bb` — `BB.Error` uses
-`@after_verify {BB.Error, :__verify_severity_impl__}`, and
-`validate_child_spec_behaviours_transformer.ex` notes that verifiers run there.
-For a solver check to run at compile time, the robot has to know which solver it
-uses, which means **declaring solvers in the DSL**:
+#### Compatibility is a property of the chain, not the robot
 
-```elixir
-settings do
-  ik_solver {BB.IK.DLS, max_iterations: 100}
-end
-```
+This proposal deliberately stops at the callback and does **not** enforce it,
+because enforcement is harder than it first appears and belongs elsewhere.
 
-A Spark verifier could then compare `supported_joint_types/0` against the
-topology's joint types and warn or fail during compilation, using exactly the
-same callback this proposal adds.
+The naive check — "this robot has a floating joint, so refuse FABRIK" — is wrong.
+Consider a legged robot: the body floats, but each leg is solved as its own chain
+from body to foot, and those chains contain nothing but revolute joints. FABRIK
+is a perfectly good choice there. A robot-level check would false-positive on
+exactly the case where the solver is being used correctly.
 
-That change is worth making on its own merits, independently of multi-DoF joints.
-Solver options are currently an untyped keyword list with no schema or
-validation, and `bb_ik_dls` and `bb_ik_fabrik` already disagree on their
-`max_iterations` defaults — 100 against 50 — with nothing to reconcile them.
-Declaring solvers in the DSL would subject them to the same option validation
-every other component already gets.
+So the question is never "does this solver support this robot" but "does this
+solver support **this chain**" — which depends on which chain is being solved, and
+therefore on how the caller has scoped the problem.
 
-It is out of scope here. This proposal adds the callback and the call-time check,
-which is what correctness requires; see Open Questions.
+That has two consequences:
+
+1. **A runtime check is possible but is the wrong shape.** `BB.Motion` could
+   compare the chain's joint types against `supported_joint_types/0` on every
+   call. It would be correct, but a wrong solver choice is a *configuration*
+   error, and configuration errors should surface when the configuration is
+   written, not when the robot is running.
+
+2. **A compile-time check needs the chains to be declarable.** For a Spark
+   verifier to check anything, the robot has to know which solver solves which
+   chain. That means expressing solver configuration in the DSL — something
+   closer to
+
+   ```elixir
+   # Illustrative only; the real shape needs design work.
+   settings do
+     ik_solver :legs, {BB.IK.FABRIK, max_iterations: 50},
+       chains: [{:body, :front_left_foot}, {:body, :front_right_foot}]
+
+     ik_solver :arm, {BB.IK.DLS, max_iterations: 100},
+       chains: [{:torso, :gripper}]
+   end
+   ```
+
+   at which point `@after_verify` — already an established pattern in `bb`, via
+   `BB.Error`'s `@after_verify {BB.Error, :__verify_severity_impl__}` — can
+   compare each declared chain's joint types against its solver's declared
+   support and fail the build.
+
+That is a substantial design problem in its own right: it has to express chains,
+per-chain solver options, and probably per-chain solver *selection* at runtime,
+and it interacts with what the root link means once the base floats. It is not
+something to smuggle into a proposal about joint types.
+
+It is also worth doing independently of multi-DoF joints. Solver options are
+currently an untyped keyword list with no schema or validation, and `bb_ik_dls`
+and `bb_ik_fabrik` already disagree on their `max_iterations` defaults — 100
+against 50 — with nothing to reconcile them. Declaring solvers in the DSL would
+bring them under the same option validation every other component gets.
+
+**Consequence for sequencing.** Until that proposal lands there is no check, and
+FABRIK handed a chain containing a multi-DoF joint will produce a wrong answer
+rather than a refusal. That is a real gap and it is called out in Open Questions
+rather than papered over with a runtime error that the eventual compile-time check
+would replace.
 
 ### Message payloads
 
@@ -425,10 +532,13 @@ positions = BB.Robot.State.get_all_positions(state)
       `defn` kernel expects
 - [ ] Jacobian width is the sum of DoF along the chain; a floating joint
       contributes three translation and three rotation columns
+- [ ] Multi-DoF configurations are stored losslessly — bit-exact round-trip
+      through ETS, with no quaternion decomposition and no tensor structs held in
+      the table
+- [ ] `set_configuration/3` writes a whole configuration; there is no partial
+      update API
 - [ ] `BB.IK.Solver` gains an optional `supported_joint_types/0` callback,
       defaulting to the single-DoF types when unimplemented
-- [ ] `BB.Motion` refuses a solve whose chain contains a joint type the chosen
-      solver doesn't declare support for, rather than mis-solving
 - [ ] `bb_ik_fabrik` declares single-DoF support only
 - [ ] `bb_ik_dls` declares multi-DoF support and solves such chains
 - [ ] `BB.Message.Sensor.JointState` documents that it describes single-DoF
@@ -441,8 +551,9 @@ positions = BB.Robot.State.get_all_positions(state)
 
 - [ ] A compile-time verifier rejecting `axis` on a `:floating` joint, and
       requiring it on `:planar`
-- [ ] `BB.Motion` logs a warning at the first refused solve naming the offending
-      joint and its type, so the cause is obvious without reading a stacktrace
+- [ ] Documentation in both solver packages stating which joint types they handle,
+      and that `bb_ik_fabrik` on a chain containing a multi-DoF joint is wrong
+      until solver declaration lands
 - [ ] Velocity/twist representation for multi-DoF joints
 - [ ] `BB.Robot.Topology` path helpers aware of per-joint DoF
 
@@ -452,56 +563,56 @@ positions = BB.Robot.State.get_all_positions(state)
 - [ ] Geodetic conversions (Proposal 0023)
 - [ ] Odometry estimators of any kind
 - [ ] Mobile-base motion planning (Proposal 0006)
-- [ ] Non-holonomic constraints — a `:planar` joint is fully holonomic in this
-      proposal, so declaring one does not stop a solver commanding sideways
-      motion a differential-drive base can't achieve
-- [ ] Declaring IK solvers in the DSL, which is what compile-time solver
-      verification needs; see Open Questions
+- [ ] Non-holonomic constraints — a `:planar` joint is fully holonomic here, so
+      declaring one does not stop a solver commanding sideways motion a
+      differential-drive base can't achieve. The constraint belongs with the drive
+      description, not the joint
+- [ ] Declaring IK solvers and their chains in the DSL, and the compile-time
+      verification that depends on it. Needs its own proposal
+- [ ] Any enforcement of solver/joint-type compatibility. This proposal ships the
+      callback as metadata only
 
 ---
 
 ## Open Questions
 
-1. **ETS representation of a floating configuration.** A `BB.Math.Transform`
-   wraps an Nx tensor, which is heavy to store per-row and per-read. Storing
-   seven floats (quaternion plus translation) and materialising a `Transform` on
-   read is likely better, but should be measured rather than assumed.
+1. **Solver and chain declaration in the DSL.** The largest thing this proposal
+   defers, and a prerequisite for compile-time verification of solver/joint-type
+   compatibility. It has to express chains, per-chain solver selection and
+   options, and it interacts with question 2. Needs its own proposal; see
+   "Compatibility is a property of the chain, not the robot".
 
-2. **How much of `defn.ex` has to change.** The expansion could happen entirely
-   in `chain_tensors/3`, leaving the kernel untouched — or the kernel may need
-   additional masks. This wants a spike before committing to an estimate.
+2. **Root link semantics.** With a floating joint, is the root link still the
+   kinematic root, or a reference frame the robot moves *within*? A legged robot
+   solved as body-to-foot chains implies the body — not the root — is the natural
+   base for those solves, which suggests "the root" and "the base a solver works
+   from" are different concepts that currently share a name. Entangled with
+   question 1 and with the follow-up frame proposal.
 
-3. **Which frame the floating Jacobian columns are expressed in.** Body frame
-   and world frame are both defensible and the choice affects what an IK solver's
-   delta means. Should follow whatever convention makes `bb_ik_dls` correct with
-   the least special-casing.
+3. **How much of `defn.ex` has to change.** As much as is necessary. The expansion
+   may fit entirely in `chain_tensors/3`, or the kernel may need additional masks.
+   This affects effort estimation, not the design, so it wants a spike rather than
+   a decision.
 
-4. **Whether `:planar` should be non-holonomic-aware.** A differential-drive base
-   cannot translate sideways. Modelling that constraint is a solver concern
-   rather than a joint concern, but the joint may need to carry a hint. Deferring
-   risks a solver commanding physically impossible motion.
+4. **Which frame the floating Jacobian columns are expressed in.** Body frame and
+   world frame are both defensible, and the choice changes what an IK solver's
+   delta means. Should follow whatever makes `bb_ik_dls` correct with the least
+   special-casing, but interacts with question 2 — if the solver's base is the body
+   rather than the root, that likely settles it.
 
-5. **Should a floating joint be settable in parts?** Setting only the yaw of a
-   floating base is a plausible want, but a partial-update API invites
-   inconsistent intermediate states.
+5. **The gap before solver declaration lands.** Between this proposal and the
+   solver proposal, `bb_ik_fabrik` handed a chain containing a multi-DoF joint
+   produces a wrong answer with nothing to catch it. Options: ship the two
+   proposals together; ship this one and accept the window, documented in both
+   solver packages; or add a temporary runtime refusal that the compile-time check
+   later replaces. The third contradicts the preference for compile-time
+   diagnostics over runtime ones, so it is listed for completeness rather than
+   recommended.
 
-6. **Root link semantics.** With a floating joint, is the root link still the
-   kinematic root, or is it a reference frame the robot moves *within*? This
-   proposal doesn't need an answer, but the follow-up frame proposal will.
-
-7. **Should IK solvers be DSL-declared, so the check can move to compile time?**
-   `supported_joint_types/0` gives a correct call-time refusal, but a wrong
-   solver choice is a *configuration* error and configuration errors are better
-   caught during compilation. Declaring the solver in `settings` would let a
-   Spark verifier compare the callback against the topology, and would
-   incidentally bring solver options under the same validation as every other
-   component's — currently they're an unschema'd keyword list whose defaults two
-   solvers already disagree on. Probably its own proposal.
-
-8. **Whether refusal should be an error or a warning.** A hard error is safer,
-   but it would break any existing caller that passes FABRIK for a chain
-   containing a joint type it never supported — though such a caller is getting
-   wrong answers today, so "break" may be the wrong word.
+6. **Velocity for a multi-DoF joint.** A floating joint's velocity is a 6-vector
+   twist rather than a scalar. Whether that needs a new payload or fits
+   `BB.Message.Estimator.Odometry` is unresolved, but nothing in this proposal
+   produces one yet.
 
 ---
 
