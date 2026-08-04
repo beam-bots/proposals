@@ -398,7 +398,9 @@ piece of topology introspection does — `get_link/2`, `get_joint/2`,
 `parent_joint/2`, `child_joints/2`, `path_to/2`, `links_in_order/1`,
 `joints_in_order/1`.
 
-So add one, alongside the others:
+So add one, alongside the others. It returns a bare atom rather than a result
+tuple, because unlike every other lookup here it cannot fail — the DSL transformer
+guarantees exactly one root link exists:
 
 ```elixir
 @spec root_link(t()) :: atom()
@@ -461,20 +463,16 @@ them into one:
 |---|---|
 | `source_link` doesn't exist | `BB.Error.Kinematics.UnknownLink`, `role: :source` |
 | `target_link` doesn't exist | `BB.Error.Kinematics.UnknownLink`, `role: :target` |
-| source is not an ancestor of target | `BB.Error.Kinematics.DisjointChain` (new) |
+| source is not an ancestor of target | `BB.Error.Kinematics.NotAnAncestor` (new) |
 
-`DisjointChain` carries the **nearest common ancestor**, which turns the message
+`NotAnAncestor` carries the **nearest common ancestor**, which turns the message
 from a complaint into an instruction:
 
 ```elixir
-defmodule BB.Error.Kinematics.DisjointChain do
+defmodule BB.Error.Kinematics.NotAnAncestor do
   use BB.Error,
     class: :kinematics,
     fields: [:source_link, :target_link, :common_ancestor]
-
-  def message(%{source_link: source, target_link: target, common_ancestor: nil}) do
-    "#{inspect(source)} and #{inspect(target)} are not connected"
-  end
 
   def message(%{source_link: source, target_link: target, common_ancestor: ancestor}) do
     "#{inspect(source)} is not an ancestor of #{inspect(target)}; " <>
@@ -485,6 +483,16 @@ end
 
 So asking for `:left_gripper` to `:right_gripper` tells you to pass `:torso`,
 rather than handing back a `nil` to trace.
+
+**`common_ancestor` is always populated, and the error is not called
+"disjoint".** `BB.Dsl.TopologyTransformer` rejects any topology with more or fewer
+than one root link — *"There can only be one link at the root of the kinematic
+graph"* — and the DSL's nesting makes cycles structurally impossible. So the
+topology is always a single tree, which means **any two links in it share at least
+the root as a common ancestor**. Two links can never be disconnected, so there is
+no such failure to represent and no nil case to handle. The only way
+`path_between/3` can fail on two links that both exist is that the source sits
+somewhere other than above the target, which is what the name should say.
 
 ##### `UnknownLink` needs a `:role`
 
@@ -790,8 +798,9 @@ changes. That is the whole migration for an arm.
       ancestor of the target, delegated from `BB.Robot.path_between/3`
 - [ ] `path_between/3` returns `{:ok, path} | {:error, BB.Error.t()}`, never `nil`,
       distinguishing unknown source, unknown target, and disjoint chain
-- [ ] `BB.Error.Kinematics.DisjointChain`, carrying the nearest common ancestor so
-      the message names the link the caller should have passed
+- [ ] `BB.Error.Kinematics.NotAnAncestor`, always carrying the nearest common
+      ancestor so the message names the link the caller should have passed. No
+      "disconnected" case, since a single-rooted tree has none
 - [ ] `BB.Error.Kinematics.UnknownLink` gains `:role` and its `:target_link` field
       becomes `:link`, so an unknown source isn't reported as a target
 - [ ] Every introspection lookup whose `nil` meant "does not exist" returns a
