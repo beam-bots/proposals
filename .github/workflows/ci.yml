@@ -15,4 +15,4 @@ permissions:
 
 jobs:
   CI:
-    uses: beam-bots/.github/.github/workflows/docs-ci.yml@9c5d1153c28a4ae6e1d849f616d57ee1cb0ff731 # main
+    uses: beam-bots/.github/.github/workflows/docs-ci.yml@81a7abc916639ba28d6ea0eaa486a23844151dfa # main
