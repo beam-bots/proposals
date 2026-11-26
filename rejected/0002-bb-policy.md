@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Proposal: bb_policy
 
-**Status:** Implemented
+**Status:** Rejected
 **Author:** James Harton
 **Created:** 2026-01-11
 **Dependencies:** `bb_teleop` (for demonstration collection), `bb_dataset` (for
